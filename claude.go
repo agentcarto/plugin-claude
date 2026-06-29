@@ -507,6 +507,16 @@ func (p *Plugin) DetectActive(_ context.Context, ss []domain.Session, ps []domai
 			pidMatched[sid] = true
 		}
 	}
+	// shell detection: Claude Code runs its Bash tool by spawning a shell as a direct child of the
+	// claude process. A background shell (run_in_background) outlives the turn, so the runtime
+	// status flips to "idle" (and would map to Ready) while the shell is still working. Mark any
+	// session whose claude pid has a live shell child so it is not downgraded to Ready below.
+	shellRunning := map[string]bool{}
+	for _, pr := range ps {
+		if sid, ok := pidToSession[pr.PPID]; ok && isShellProcess(pr) {
+			shellRunning[sid] = true
+		}
+	}
 	// cwd approximation: the most recent session whose cwd matches a claude process is also
 	// treated as active. Processes already resolved by pid are excluded to avoid misattribution.
 	cwdMatched := map[string]bool{}
@@ -549,7 +559,23 @@ func (p *Plugin) DetectActive(_ context.Context, ss []domain.Session, ps []domai
 			s.Status = common.ActiveStatus(s.LastKind, true)
 		}
 	}
+	// A session with a live shell child is still working even if the runtime/last-event status
+	// says it is done; never present it as Ready.
+	for i := range ss {
+		if ss[i].Status == domain.StatusReady && shellRunning[ss[i].SessionID] {
+			ss[i].Status = domain.StatusRunning
+		}
+	}
 	return ss, nil
+}
+
+// shellNames lists the executable basenames Claude Code uses to run its Bash tool.
+var shellNames = map[string]bool{"sh": true, "bash": true, "zsh": true, "fish": true, "dash": true, "ksh": true}
+
+// isShellProcess reports whether a process is an interactive shell (used to detect a Bash tool's
+// child shell still running under a claude session).
+func isShellProcess(p domain.Process) bool {
+	return shellNames[filepath.Base(p.Executable)]
 }
 
 func (p *Plugin) PlanFork(_ context.Context, s domain.Session, t domain.ForkTarget) (domain.MutationPlan, domain.Command, error) {

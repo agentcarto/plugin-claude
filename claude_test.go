@@ -412,6 +412,41 @@ func TestDetectActiveMatchesByRuntimePID(t *testing.T) {
 	}
 }
 
+// A background shell (run_in_background) outlives the agent turn: the runtime status reports idle
+// while a shell child of the claude pid is still running. The session must not be shown as ready.
+func TestDetectActiveShellChildKeepsRunning(t *testing.T) {
+	rt := t.TempDir()
+	sid := "sid-shell"
+	if err := os.WriteFile(filepath.Join(rt, "4242.json"), []byte(`{"sessionId":"`+sid+`","pid":4242,"status":"idle"}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	p := &Plugin{id: "claude", o: Options{RuntimeDir: rt, Executable: "claude"}}
+	sess := []domain.Session{{PluginID: "claude", AgentType: "claude", SessionID: sid, LastKind: domain.EventToolResult}}
+
+	// No shell child: idle runtime maps to ready.
+	ready, err := p.DetectActive(context.Background(), append([]domain.Session(nil), sess...), []domain.Process{{PID: 4242, Executable: "claude"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ready[0].Status != domain.StatusReady {
+		t.Fatalf("no shell child should be ready: %#v", ready[0])
+	}
+
+	// A live shell child of the claude pid keeps it running; a non-shell child (e.g. MCP server) does not.
+	ps := []domain.Process{
+		{PID: 4242, Executable: "claude"},
+		{PID: 5000, PPID: 4242, Executable: "npm"},
+		{PID: 5001, PPID: 4242, Executable: "zsh"},
+	}
+	run, err := p.DetectActive(context.Background(), append([]domain.Session(nil), sess...), ps)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if run[0].Status != domain.StatusRunning {
+		t.Fatalf("live shell child should keep running: %#v", run[0])
+	}
+}
+
 // When several sessions run concurrently in the same cwd, cwd approximation alone only catches
 // the most recent one and misattributes the older ones. Verify that pid matching from the runtime
 // json correctly resolves both.
