@@ -261,6 +261,34 @@ func TestLoadConversationWithoutUUIDFallsBackToLinear(t *testing.T) {
 	}
 }
 
+// Regression for the OOM where opening a session detail made the plugin allocate
+// memory without bound. A transcript whose parent links form a cycle (X<->Y) plus
+// a queued message drives LoadConversation -> attachQueued -> ActivePath, which
+// used to walk the cyclic chain forever, ramping RSS until the process was killed.
+func TestLoadConversationCyclicParentTerminates(t *testing.T) {
+	d := t.TempDir()
+	src := filepath.Join(d, "s.jsonl")
+	data := []byte(
+		`{"uuid":"X","parentUuid":"Y","timestamp":"2026-01-01T00:00:00Z","message":{"role":"user","content":[{"type":"text","text":"x"}]}}`+"\n"+
+			`{"uuid":"Y","parentUuid":"X","timestamp":"2026-01-01T00:00:01Z","message":{"role":"assistant","content":[{"type":"text","text":"y"}]}}`+"\n"+
+			`{"uuid":"L","parentUuid":"X","timestamp":"2026-01-01T00:00:02Z","message":{"role":"user","content":[{"type":"text","text":"l"}]}}`+"\n"+
+			`{"type":"queue-operation","operation":"enqueue","content":"queued msg","timestamp":"2026-01-01T00:00:03Z"}`+"\n")
+	if err := os.WriteFile(src, data, 0600); err != nil {
+		t.Fatal(err)
+	}
+	p := &Plugin{}
+	done := make(chan struct{})
+	go func() {
+		_, _ = p.LoadConversation(context.Background(), domain.SessionRef{Source: src})
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("LoadConversation did not terminate on a cyclic transcript")
+	}
+}
+
 func TestLoadConversationNativeForkPrependsParent(t *testing.T) {
 	d := t.TempDir()
 	proj := filepath.Join(d, "proj")
