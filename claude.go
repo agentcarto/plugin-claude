@@ -225,6 +225,12 @@ func messageEvents(msg map[string]any, ts time.Time) []domain.Event {
 		case "thinking":
 			k = domain.EventReasoning
 			text = common.String(m["thinking"])
+			// Newer models encrypt the thinking into the signature and leave the
+			// thinking text empty (display:"omitted"). Skip such blocks instead of
+			// rendering a blank reasoning event.
+			if strings.TrimSpace(text) == "" {
+				continue
+			}
 		case "tool_use":
 			k = domain.EventToolCall
 			tool = common.String(m["name"])

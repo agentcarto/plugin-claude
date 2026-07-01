@@ -221,6 +221,25 @@ func TestParseContentListStringBlock(t *testing.T) {
 	}
 }
 
+func TestParseSkipsEmptyThinkingBlock(t *testing.T) {
+	d := t.TempDir()
+	src := filepath.Join(d, "s.jsonl")
+	data := []byte(`{"uuid":"a","timestamp":"2026-01-01T00:00:00Z","message":{"role":"assistant","content":[{"type":"thinking","thinking":"","signature":"sig"},{"type":"thinking","thinking":"real thought"},{"type":"text","text":"answer"}]}}` + "\n")
+	if err := os.WriteFile(src, data, 0600); err != nil {
+		t.Fatal(err)
+	}
+	ev, _, _, _, _, _, _, _ := parse(context.Background(), src)
+	var reasoning []string
+	for _, e := range ev {
+		if e.Kind == domain.EventReasoning {
+			reasoning = append(reasoning, e.Text)
+		}
+	}
+	if len(reasoning) != 1 || reasoning[0] != "real thought" {
+		t.Fatalf("expected only the non-empty thinking block, got %#v", reasoning)
+	}
+}
+
 func TestParseEndTurnNotAddedToConversationNode(t *testing.T) {
 	d := t.TempDir()
 	src := filepath.Join(d, "s.jsonl")
