@@ -288,10 +288,10 @@ func TestLoadConversationCyclicParentTerminates(t *testing.T) {
 	d := t.TempDir()
 	src := filepath.Join(d, "s.jsonl")
 	data := []byte(
-		`{"uuid":"X","parentUuid":"Y","timestamp":"2026-01-01T00:00:00Z","message":{"role":"user","content":[{"type":"text","text":"x"}]}}`+"\n"+
-			`{"uuid":"Y","parentUuid":"X","timestamp":"2026-01-01T00:00:01Z","message":{"role":"assistant","content":[{"type":"text","text":"y"}]}}`+"\n"+
-			`{"uuid":"L","parentUuid":"X","timestamp":"2026-01-01T00:00:02Z","message":{"role":"user","content":[{"type":"text","text":"l"}]}}`+"\n"+
-			`{"type":"queue-operation","operation":"enqueue","content":"queued msg","timestamp":"2026-01-01T00:00:03Z"}`+"\n")
+		`{"uuid":"X","parentUuid":"Y","timestamp":"2026-01-01T00:00:00Z","message":{"role":"user","content":[{"type":"text","text":"x"}]}}` + "\n" +
+			`{"uuid":"Y","parentUuid":"X","timestamp":"2026-01-01T00:00:01Z","message":{"role":"assistant","content":[{"type":"text","text":"y"}]}}` + "\n" +
+			`{"uuid":"L","parentUuid":"X","timestamp":"2026-01-01T00:00:02Z","message":{"role":"user","content":[{"type":"text","text":"l"}]}}` + "\n" +
+			`{"type":"queue-operation","operation":"enqueue","content":"queued msg","timestamp":"2026-01-01T00:00:03Z"}` + "\n")
 	if err := os.WriteFile(src, data, 0600); err != nil {
 		t.Fatal(err)
 	}

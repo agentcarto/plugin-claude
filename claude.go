@@ -35,7 +35,7 @@ func (Factory) Descriptor() plugin.Descriptor {
 	// (NodesHaveRealContent) is shipped without bumping ParserVersion. The TUI discards warm
 	// state and fully re-parses on every startup (tui.scan's initial full pass), so even with an
 	// old cache the exclusion takes effect on the next launch.
-	return plugin.Descriptor{Type: "claude", DisplayName: "Claude", ParserVersion: "3", Capabilities: domain.Capabilities{Scan: true, Conversation: true, Active: true, Resume: true, Rewind: true, Relocate: true}}
+	return plugin.Descriptor{Type: "claude", DisplayName: "Claude", ParserVersion: "4", Capabilities: domain.Capabilities{Scan: true, Conversation: true, Active: true, Resume: true, Rewind: true, Relocate: true}}
 }
 
 func (Factory) New(id string, n *yaml.Node) (any, error) {
@@ -596,8 +596,10 @@ func (p *Plugin) PlanFork(_ context.Context, s domain.Session, t domain.ForkTarg
 	var rows []map[string]any
 	parents := map[string]string{}
 	for _, line := range lines {
-		var o map[string]any
-		if json.Unmarshal([]byte(line), &o) != nil {
+		// Lossless decode: every kept row is re-encoded below (they all gain
+		// parent links), and a float64 round trip would corrupt >2^53 integers.
+		o, e := common.UnmarshalJSONMap([]byte(line))
+		if e != nil {
 			continue
 		}
 		rows = append(rows, o)
@@ -633,9 +635,11 @@ func (p *Plugin) PlanFork(_ context.Context, s domain.Session, t domain.ForkTarg
 		// Attach parent links so this shows up as a fork (branch) of the original session.
 		o["parentSessionId"] = s.SessionID
 		o["parentLastUuid"] = t.NodeID
-		x, _ := json.Marshal(o)
+		x, e := common.MarshalJSONLine(o)
+		if e != nil {
+			return domain.MutationPlan{}, domain.Command{}, e
+		}
 		out.Write(x)
-		out.WriteByte('\n')
 	}
 	path := filepath.Join(filepath.Dir(s.SourceRef.Source), newID+".jsonl")
 	plan := domain.MutationPlan{PluginID: p.id, Description: "fork Claude session", AllowedRoots: []string{p.o.ProjectsDir}, Writes: []domain.FileWrite{{Path: path, Data: out.Bytes(), Mode: 0600}}}
