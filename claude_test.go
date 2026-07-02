@@ -240,6 +240,72 @@ func TestParseSkipsEmptyThinkingBlock(t *testing.T) {
 	}
 }
 
+// A tool_result whose content has no text blocks (a screenshot, a tool
+// reference) must show what is there instead of an empty result.
+func TestParseToolResultNonTextPlaceholder(t *testing.T) {
+	d := t.TempDir()
+	src := filepath.Join(d, "s.jsonl")
+	data := []byte(`{"uuid":"a","timestamp":"2026-01-01T00:00:00Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":[{"type":"image","source":{"type":"base64","data":"iVBOR"}}]},{"type":"tool_result","tool_use_id":"t2","content":[{"type":"tool_reference","tool_name":"WebFetch"}]}]}}` + "\n")
+	if err := os.WriteFile(src, data, 0600); err != nil {
+		t.Fatal(err)
+	}
+	ev, _, _, _, _, _, _, _ := parse(context.Background(), src)
+	var results []string
+	for _, e := range ev {
+		if e.Kind == domain.EventToolResult {
+			results = append(results, e.Text)
+		}
+	}
+	if len(results) != 2 || results[0] != "[image]" || results[1] != "[tool: WebFetch]" {
+		t.Fatalf("results=%#v", results)
+	}
+}
+
+// away_summary system records carry the recap of what the agent did while the
+// user was away; they surface as assistant text like Claude Code shows them.
+func TestParseSystemAwaySummary(t *testing.T) {
+	d := t.TempDir()
+	src := filepath.Join(d, "s.jsonl")
+	data := []byte(`{"uuid":"a","parentUuid":"","timestamp":"2026-01-01T00:00:00Z","type":"system","subtype":"away_summary","content":"built the slides and verified the output","isMeta":false}` + "\n")
+	if err := os.WriteFile(src, data, 0600); err != nil {
+		t.Fatal(err)
+	}
+	ev, nodes, _, _, _, _, _, _ := parse(context.Background(), src)
+	if len(ev) != 1 || ev[0].Kind != domain.EventAssistant || ev[0].Text != "built the slides and verified the output" {
+		t.Fatalf("events=%#v", ev)
+	}
+	if len(nodes) != 1 || len(nodes[0].Events) != 1 {
+		t.Fatalf("nodes=%#v", nodes)
+	}
+}
+
+// Newer versions log slash commands only as system/local_command records; the
+// command invocation must surface as a user event (the core logic turns the
+// <command-name> wrapper into a turn boundary) while empty output wrappers stay
+// silent.
+func TestParseSystemLocalCommand(t *testing.T) {
+	d := t.TempDir()
+	src := filepath.Join(d, "s.jsonl")
+	data := []byte(`{"uuid":"a","timestamp":"2026-01-01T00:00:00Z","type":"system","subtype":"local_command","content":"<command-name>/fork</command-name><command-args>f2</command-args>"}` + "\n" +
+		`{"uuid":"b","parentUuid":"a","timestamp":"2026-01-01T00:00:01Z","type":"system","subtype":"local_command","content":"<local-command-stdout></local-command-stdout>","level":"info"}` + "\n" +
+		`{"uuid":"c","parentUuid":"b","timestamp":"2026-01-01T00:00:02Z","type":"system","subtype":"local_command","content":"<local-command-stdout>forked to f2</local-command-stdout>","level":"info"}` + "\n")
+	if err := os.WriteFile(src, data, 0600); err != nil {
+		t.Fatal(err)
+	}
+	ev, _, _, _, _, _, _, _ := parse(context.Background(), src)
+	var got []string
+	for _, e := range ev {
+		got = append(got, string(e.Kind)+":"+e.Text)
+	}
+	want := []string{
+		"user:<command-name>/fork</command-name><command-args>f2</command-args>",
+		"user:<local-command-stdout>forked to f2</local-command-stdout>",
+	}
+	if len(got) != len(want) || got[0] != want[0] || got[1] != want[1] {
+		t.Fatalf("events=%#v want %#v", got, want)
+	}
+}
+
 func TestParseEndTurnNotAddedToConversationNode(t *testing.T) {
 	d := t.TempDir()
 	src := filepath.Join(d, "s.jsonl")

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"time"
 
@@ -35,7 +36,7 @@ func (Factory) Descriptor() plugin.Descriptor {
 	// (NodesHaveRealContent) is shipped without bumping ParserVersion. The TUI discards warm
 	// state and fully re-parses on every startup (tui.scan's initial full pass), so even with an
 	// old cache the exclusion takes effect on the next launch.
-	return plugin.Descriptor{Type: "claude", DisplayName: "Claude", ParserVersion: "4", Capabilities: domain.Capabilities{Scan: true, Conversation: true, Active: true, Resume: true, Rewind: true, Relocate: true}}
+	return plugin.Descriptor{Type: "claude", DisplayName: "Claude", ParserVersion: "5", Capabilities: domain.Capabilities{Scan: true, Conversation: true, Active: true, Resume: true, Rewind: true, Relocate: true}}
 }
 
 func (Factory) New(id string, n *yaml.Node) (any, error) {
@@ -238,6 +239,11 @@ func messageEvents(msg map[string]any, ts time.Time) []domain.Event {
 		case "tool_result":
 			k = domain.EventToolResult
 			text = common.Text(m["content"])
+			// Image or tool_reference results have no text blocks; mark what is
+			// there instead of showing an empty result.
+			if strings.TrimSpace(text) == "" {
+				text = nonTextSummary(m["content"])
+			}
 		}
 		if k != domain.EventMeta {
 			es = append(es, domain.Event{Kind: k, Text: text, Timestamp: ts, ToolName: tool, RawType: bt})
@@ -250,6 +256,54 @@ func messageEvents(msg map[string]any, ts time.Time) []domain.Event {
 		}
 	}
 	return es
+}
+
+// nonTextSummary renders a placeholder line per non-text content block, e.g.
+// "[image]" for a screenshot result or "[tool: WebFetch]" for a tool reference.
+func nonTextSummary(v any) string {
+	var lines []string
+	for _, b := range common.Slice(v) {
+		m := common.Map(b)
+		switch bt := common.String(m["type"]); bt {
+		case "", "text":
+		case "tool_reference":
+			lines = append(lines, "[tool: "+common.String(m["tool_name"])+"]")
+		default:
+			lines = append(lines, "["+bt+"]")
+		}
+	}
+	return strings.Join(lines, "\n")
+}
+
+// systemEvents surfaces the system records that carry conversation content:
+// away_summary (what the agent accomplished while the user was away) and
+// local_command (slash-command invocations and their output, which newer
+// versions log here instead of as user records).
+func systemEvents(o map[string]any, ts time.Time) []domain.Event {
+	content := strings.TrimSpace(common.String(o["content"]))
+	if content == "" {
+		return nil
+	}
+	switch common.String(o["subtype"]) {
+	case "away_summary":
+		return []domain.Event{{Kind: domain.EventAssistant, Text: content, Timestamp: ts, RawType: "away_summary"}}
+	case "local_command":
+		if emptyCommandOutput(content) {
+			return nil
+		}
+		// As a user event, the core conversation logic handles the
+		// <command-name>/<local-command-stdout> wrappers exactly like the
+		// user-record form older versions wrote.
+		return []domain.Event{{Kind: domain.EventUser, Text: content, Timestamp: ts, RawType: "local_command"}}
+	}
+	return nil
+}
+
+var emptyCommandOutputRE = regexp.MustCompile(`^<local-command-std(out|err)>\s*</local-command-std(out|err)>$`)
+
+// emptyCommandOutput reports whether content is an output wrapper with nothing in it.
+func emptyCommandOutput(content string) bool {
+	return emptyCommandOutputRE.MatchString(content)
 }
 
 func parse(ctx context.Context, path string) (ev []domain.Event, nodes []domain.ConvNode, queued []domain.Event, cwd string, start time.Time, model, parentSID, parentLast string) {
@@ -287,6 +341,9 @@ func parse(ctx context.Context, path string) (ev []domain.Event, nodes []domain.
 		var es []domain.Event
 		if !meta {
 			es = messageEvents(msg, ts)
+			if common.String(o["type"]) == "system" {
+				es = append(es, systemEvents(o, ts)...)
+			}
 		}
 		// The /compact auto-summary node is marked so the heading can render it as a boundary.
 		if b, ok := o["isCompactSummary"].(bool); ok && b {
