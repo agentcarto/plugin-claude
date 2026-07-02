@@ -36,7 +36,9 @@ func (Factory) Descriptor() plugin.Descriptor {
 	// (NodesHaveRealContent) is shipped without bumping ParserVersion. The TUI discards warm
 	// state and fully re-parses on every startup (tui.scan's initial full pass), so even with an
 	// old cache the exclusion takes effect on the next launch.
-	return plugin.Descriptor{Type: "claude", DisplayName: "Claude", ParserVersion: "5", Capabilities: domain.Capabilities{Scan: true, Conversation: true, Active: true, Resume: true, Rewind: true, Relocate: true}}
+	// ParserVersion=6: user events now carry the normalized Prompt/Command fields
+	// (agent-specific pseudo-prompt/command vocabulary moved out of core).
+	return plugin.Descriptor{Type: "claude", DisplayName: "Claude", ParserVersion: "6", Capabilities: domain.Capabilities{Scan: true, Conversation: true, Active: true, Resume: true, Rewind: true, Relocate: true}}
 }
 
 func (Factory) New(id string, n *yaml.Node) (any, error) {
@@ -348,9 +350,10 @@ func parse(ctx context.Context, path string) (ev []domain.Event, nodes []domain.
 		// The /compact auto-summary node is marked so the heading can render it as a boundary.
 		if b, ok := o["isCompactSummary"].(bool); ok && b {
 			for i := range es {
-				es[i].RawType = "compact_summary"
+				es[i].RawType = domain.RawCompactSummary
 			}
 		}
+		annotate(es)
 		ev = append(ev, es...)
 		if sr := common.String(msg["stop_reason"]); sr == "end_turn" {
 			ev = append(ev, domain.Event{Kind: domain.EventTurnComplete, Timestamp: ts, RawType: "end_turn"})
@@ -392,7 +395,7 @@ func attachQueued(c *domain.Conversation, queued []domain.Event) {
 	}
 	for _, q := range queued {
 		t := strings.TrimSpace(q.Text)
-		if t == "" || conversation.IsPseudoPrompt(t) || real[norm(t)] {
+		if t == "" || isPseudoPrompt(t) || real[norm(t)] {
 			continue
 		}
 		target := path[0]
