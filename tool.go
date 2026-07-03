@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"strings"
 
+	"github.com/agentcarto/core/common"
 	"github.com/agentcarto/core/domain"
 )
 
@@ -51,12 +52,7 @@ func annotateTool(e *domain.Event) {
 			return
 		}
 	}
-	for _, k := range []string{"description", "file_path", "notebook_path", "path", "command", "pattern", "query", "url", "prompt"} {
-		if v := strings.TrimSpace(stringArg(inp, k)); v != "" {
-			e.ToolArg = v
-			return
-		}
-	}
+	e.ToolArg = common.ToolArgFromJSON(e.Text)
 }
 
 // editChange builds the normalized FileChange for one edit-tool invocation,

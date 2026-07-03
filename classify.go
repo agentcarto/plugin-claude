@@ -4,6 +4,7 @@ import (
 	"regexp"
 	"strings"
 
+	"github.com/agentcarto/core/common"
 	"github.com/agentcarto/core/domain"
 )
 
@@ -35,7 +36,7 @@ func isPseudoPrompt(s string) bool {
 			return true
 		}
 	}
-	return strings.HasPrefix(s, "/") && !strings.Contains(s, "\n") && len([]rune(s)) <= 40
+	return common.IsBareSlashCommand(s)
 }
 
 // promptText returns the cleaned, whitespace-folded genuine prompt in text,
