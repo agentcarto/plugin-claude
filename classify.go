@@ -69,15 +69,22 @@ func commandLabel(text string) string {
 	return ""
 }
 
-// annotate fills the normalized Prompt/Command fields on user events, in
-// place. Compact summaries are boundaries of their own kind and never carry
-// a prompt.
+// annotate fills the normalized display fields, in place: Prompt/Command on
+// user events (compact summaries are boundaries of their own kind and never
+// carry a prompt), EventTask conversion for task notifications, and
+// ToolArg/ToolDetail/Changes on tool calls.
 func annotate(es []domain.Event) {
 	for i := range es {
-		if es[i].Kind != domain.EventUser || es[i].RawType == domain.RawCompactSummary {
-			continue
+		switch {
+		case es[i].Kind == domain.EventToolCall:
+			annotateTool(&es[i])
+		case es[i].Kind == domain.EventUser && es[i].RawType != domain.RawCompactSummary:
+			if t, ok := parseTaskNotification(es[i].Text); ok {
+				taskEvent(&es[i], t)
+				continue
+			}
+			es[i].Prompt = promptText(es[i].Text)
+			es[i].Command = commandLabel(es[i].Text)
 		}
-		es[i].Prompt = promptText(es[i].Text)
-		es[i].Command = commandLabel(es[i].Text)
 	}
 }

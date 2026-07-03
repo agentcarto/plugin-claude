@@ -38,7 +38,9 @@ func (Factory) Descriptor() plugin.Descriptor {
 	// old cache the exclusion takes effect on the next launch.
 	// ParserVersion=6: user events now carry the normalized Prompt/Command fields
 	// (agent-specific pseudo-prompt/command vocabulary moved out of core).
-	return plugin.Descriptor{Type: "claude", DisplayName: "Claude", ParserVersion: "6", Capabilities: domain.Capabilities{Scan: true, Conversation: true, Active: true, Resume: true, Rewind: true, Relocate: true}}
+	// ParserVersion=7: tool calls carry ToolArg/ToolDetail/Changes and task
+	// notifications become EventTask (agent-specific rendering moved out of the host).
+	return plugin.Descriptor{Type: "claude", DisplayName: "Claude", ParserVersion: "7", Capabilities: domain.Capabilities{Scan: true, Conversation: true, Active: true, Resume: true, Rewind: true, Relocate: true}}
 }
 
 func (Factory) New(id string, n *yaml.Node) (any, error) {
