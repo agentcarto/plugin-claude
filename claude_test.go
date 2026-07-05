@@ -240,6 +240,37 @@ func TestParseSkipsEmptyThinkingBlock(t *testing.T) {
 	}
 }
 
+// Each assistant record's model is stamped onto the events it produces, so the
+// host can show per-turn models even when the model changes mid-session. The
+// session-level model stays the first assistant's model.
+func TestParsePerTurnModel(t *testing.T) {
+	d := t.TempDir()
+	src := filepath.Join(d, "s.jsonl")
+	data := []byte(`{"uuid":"a1","type":"assistant","timestamp":"2026-01-01T00:00:00Z","message":{"role":"assistant","model":"claude-sonnet-5","content":[{"type":"text","text":"first"}]}}` + "\n" +
+		`{"uuid":"a2","type":"assistant","timestamp":"2026-01-01T00:00:01Z","message":{"role":"assistant","model":"claude-opus-4-8","content":[{"type":"text","text":"second"}]}}` + "\n")
+	if err := os.WriteFile(src, data, 0600); err != nil {
+		t.Fatal(err)
+	}
+	_, nodes, _, _, _, model, _, _ := parse(context.Background(), src)
+	if model != "claude-sonnet-5" {
+		t.Fatalf("session model = %q, want first assistant's model", model)
+	}
+	if len(nodes) != 2 {
+		t.Fatalf("nodes=%#v", nodes)
+	}
+	want := []string{"claude-sonnet-5", "claude-opus-4-8"}
+	for i, n := range nodes {
+		if len(n.Events) == 0 {
+			t.Fatalf("node %d has no events", i)
+		}
+		for _, e := range n.Events {
+			if e.Model != want[i] {
+				t.Fatalf("node %d event model = %q, want %q", i, e.Model, want[i])
+			}
+		}
+	}
+}
+
 // A tool_result whose content has no text blocks (a screenshot, a tool
 // reference) must show what is there instead of an empty result.
 func TestParseToolResultNonTextPlaceholder(t *testing.T) {

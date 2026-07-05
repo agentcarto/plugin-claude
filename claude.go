@@ -355,6 +355,14 @@ func parse(ctx context.Context, path string) (ev []domain.Event, nodes []domain.
 				es[i].RawType = domain.RawCompactSummary
 			}
 		}
+		// Stamp each event from an assistant record with the model that produced
+		// it, so the host can show per-turn models. Session.Model still takes the
+		// first model (above) as the session-level fallback.
+		if recModel := common.String(msg["model"]); recModel != "" {
+			for i := range es {
+				es[i].Model = recModel
+			}
+		}
 		annotate(es)
 		ev = append(ev, es...)
 		if sr := common.String(msg["stop_reason"]); sr == "end_turn" {
