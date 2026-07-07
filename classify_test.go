@@ -31,7 +31,11 @@ func TestCommandLabel(t *testing.T) {
 	cases := []struct{ in, want string }{
 		{"<command-name>/verify</command-name>", "/verify"},
 		{"<command-message>x</command-message>\n<command-name>fix</command-name>", "/fix"},
+		{"<command-message>verify</command-message>\n<command-name>/verify</command-name>\n<command-args>@notes.md</command-args>", "/verify @notes.md"},
+		{"<command-name>/verify</command-name>\n<command-args>a\n   b</command-args>", "/verify a b"},
+		{"<command-name>/verify</command-name>\n<command-args></command-args>", "/verify"},
 		{"<command-name>/clear</command-name>", ""},
+		{"<command-name>/clear</command-name><command-args>now</command-args>", ""},
 		{"<bash-input>ls   -la</bash-input>", "! ls -la"},
 		{"quoting <bash-input>x</bash-input> mid-text", ""},
 		{"plain prompt", ""},

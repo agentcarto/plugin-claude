@@ -40,7 +40,9 @@ func (Factory) Descriptor() plugin.Descriptor {
 	// (agent-specific pseudo-prompt/command vocabulary moved out of core).
 	// ParserVersion=7: tool calls carry ToolArg/ToolDetail/Changes and task
 	// notifications become EventTask (agent-specific rendering moved out of the host).
-	return plugin.Descriptor{Type: "claude", DisplayName: "Claude", ParserVersion: "7", Capabilities: domain.Capabilities{Scan: true, Conversation: true, Active: true, Resume: true, Rewind: true, Relocate: true}}
+	// ParserVersion=8: command labels include <command-args> and user file/directory
+	// attachments become EventAttachment.
+	return plugin.Descriptor{Type: "claude", DisplayName: "Claude", ParserVersion: "8", Capabilities: domain.Capabilities{Scan: true, Conversation: true, Active: true, Resume: true, Rewind: true, Relocate: true}}
 }
 
 func (Factory) New(id string, n *yaml.Node) (any, error) {
@@ -303,6 +305,27 @@ func systemEvents(o map[string]any, ts time.Time) []domain.Event {
 	return nil
 }
 
+// attachmentEvents surfaces the attachment records a user file/directory
+// reference (an @-mention or a command argument) injects into the context:
+// ToolArg carries the path, Text the injected content. The many other
+// attachment subtypes (reminders, tool/skill listings, …) are system noise
+// and produce no events; their nodes still keep the tree connected.
+func attachmentEvents(o map[string]any, ts time.Time) []domain.Event {
+	a := common.Map(o["attachment"])
+	switch common.String(a["type"]) {
+	case "file":
+		f := common.Map(common.Map(a["content"])["file"])
+		path := common.String(a["filename"])
+		if path == "" {
+			path = common.String(f["filePath"])
+		}
+		return []domain.Event{{Kind: domain.EventAttachment, ToolArg: path, Text: common.String(f["content"]), Timestamp: ts, RawType: "attachment"}}
+	case "directory":
+		return []domain.Event{{Kind: domain.EventAttachment, ToolArg: common.String(a["path"]), Text: common.String(a["content"]), Timestamp: ts, RawType: "attachment"}}
+	}
+	return nil
+}
+
 var emptyCommandOutputRE = regexp.MustCompile(`^<local-command-std(out|err)>\s*</local-command-std(out|err)>$`)
 
 // emptyCommandOutput reports whether content is an output wrapper with nothing in it.
@@ -345,8 +368,11 @@ func parse(ctx context.Context, path string) (ev []domain.Event, nodes []domain.
 		var es []domain.Event
 		if !meta {
 			es = messageEvents(msg, ts)
-			if common.String(o["type"]) == "system" {
+			switch common.String(o["type"]) {
+			case "system":
 				es = append(es, systemEvents(o, ts)...)
+			case "attachment":
+				es = append(es, attachmentEvents(o, ts)...)
 			}
 		}
 		// The /compact auto-summary node is marked so the heading can render it as a boundary.

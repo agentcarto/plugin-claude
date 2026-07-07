@@ -337,6 +337,34 @@ func TestParseSystemLocalCommand(t *testing.T) {
 	}
 }
 
+// User @-mentions (and slash-command file arguments) inject file/directory
+// content as top-level attachment records; they surface as EventAttachment
+// (path in ToolArg, content in Text) while the many system-noise attachment
+// subtypes (reminders, listings, …) stay invisible with their nodes intact.
+func TestParseAttachmentFileAndDirectory(t *testing.T) {
+	d := t.TempDir()
+	src := filepath.Join(d, "s.jsonl")
+	data := []byte(`{"uuid":"a","timestamp":"2026-01-01T00:00:00Z","type":"attachment","attachment":{"type":"file","filename":"/w/notes.md","content":{"type":"text","file":{"filePath":"/w/notes.md","content":"# Notes\nbody"}}}}` + "\n" +
+		`{"uuid":"b","parentUuid":"a","timestamp":"2026-01-01T00:00:01Z","type":"attachment","attachment":{"type":"directory","path":"/w/docs","content":"a.md\nb.md"}}` + "\n" +
+		`{"uuid":"c","parentUuid":"b","timestamp":"2026-01-01T00:00:02Z","type":"attachment","attachment":{"type":"task_reminder","content":"noise"}}` + "\n")
+	if err := os.WriteFile(src, data, 0600); err != nil {
+		t.Fatal(err)
+	}
+	ev, nodes, _, _, _, _, _, _ := parse(context.Background(), src)
+	if len(ev) != 2 || ev[0].Kind != domain.EventAttachment || ev[1].Kind != domain.EventAttachment {
+		t.Fatalf("events=%#v", ev)
+	}
+	if ev[0].ToolArg != "/w/notes.md" || ev[0].Text != "# Notes\nbody" {
+		t.Fatalf("file attachment=%#v", ev[0])
+	}
+	if ev[1].ToolArg != "/w/docs" || ev[1].Text != "a.md\nb.md" {
+		t.Fatalf("directory attachment=%#v", ev[1])
+	}
+	if len(nodes) != 3 || len(nodes[2].Events) != 0 {
+		t.Fatalf("nodes=%#v", nodes)
+	}
+}
+
 func TestParseEndTurnNotAddedToConversationNode(t *testing.T) {
 	d := t.TempDir()
 	src := filepath.Join(d, "s.jsonl")

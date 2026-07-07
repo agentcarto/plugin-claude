@@ -9,6 +9,7 @@ import (
 )
 
 var commandRE = regexp.MustCompile(`<command-name>\s*([^<]+?)\s*</command-name>`)
+var commandArgsRE = regexp.MustCompile(`(?s)<command-args>\s*(.*?)\s*</command-args>`)
 var bashInputRE = regexp.MustCompile(`(?s)^<bash-input>\s*(.*?)\s*</bash-input>`)
 
 // pseudoPromptPrefixes lists Claude Code's system-injected wrappers: text
@@ -50,9 +51,10 @@ func promptText(text string) string {
 }
 
 // commandLabel returns the normalized label of a user-issued command: a slash
-// command recorded as <command-name> ("/verify"), or a "!"-prefixed shell
-// command recorded as <bash-input> ("! ls -la"). /clear only wipes the screen
-// and must not open a turn or title, so it yields "".
+// command recorded as <command-name> with its <command-args> appended
+// ("/verify @notes.md"), or a "!"-prefixed shell command recorded as
+// <bash-input> ("! ls -la"). /clear only wipes the screen and must not open a
+// turn or title, so it yields "".
 func commandLabel(text string) string {
 	if m := commandRE.FindStringSubmatch(text); len(m) > 1 {
 		name := strings.TrimSpace(m[1])
@@ -61,6 +63,9 @@ func commandLabel(text string) string {
 		}
 		if name == "/clear" {
 			return ""
+		}
+		if a := commandArgsRE.FindStringSubmatch(text); len(a) > 1 && a[1] != "" {
+			name += " " + strings.Join(strings.Fields(a[1]), " ")
 		}
 		return name
 	}
