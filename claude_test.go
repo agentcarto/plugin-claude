@@ -292,10 +292,21 @@ func TestParseToolResultNonTextPlaceholder(t *testing.T) {
 	}
 }
 
-// The advisor is invoked as a server-side tool: its call is a server_tool_use
-// block and its (encrypted) advice comes back as advisor_tool_result. Both must
-// surface in the turn — a tool call plus a redacted result placeholder — rather
-// than being silently dropped.
+// findKind returns the last event of the given kind, or nil.
+func findKind(ev []domain.Event, k domain.EventKind) *domain.Event {
+	var got *domain.Event
+	for i := range ev {
+		if ev[i].Kind == k {
+			got = &ev[i]
+		}
+	}
+	return got
+}
+
+// The advisor is invoked as a server-side tool (server_tool_use "advisor" +
+// advisor_tool_result). It folds into a single EventToolCall — advisor is a
+// tool — so the empty call block is dropped and the result is merged into the
+// call. Exactly one tool call surfaces, named for the advising model.
 func TestParseAdvisorServerToolBlocks(t *testing.T) {
 	d := t.TempDir()
 	src := filepath.Join(d, "s.jsonl")
@@ -304,22 +315,53 @@ func TestParseAdvisorServerToolBlocks(t *testing.T) {
 		t.Fatal(err)
 	}
 	ev, _, _, _, _, _, _, _ := parse(context.Background(), src)
-	var call, result *domain.Event
-	for i := range ev {
-		switch ev[i].Kind {
-		case domain.EventToolCall:
-			call = &ev[i]
-		case domain.EventToolResult:
-			result = &ev[i]
-		}
+	if r := findKind(ev, domain.EventToolResult); r != nil {
+		t.Fatalf("advisor should fold into one call block, not a separate result, got %#v", r)
 	}
-	if call == nil || call.ToolName != "advisor" {
-		t.Fatalf("expected an advisor tool call, got %#v", ev)
+	call := findKind(ev, domain.EventToolCall)
+	if call == nil || call.ToolName != "ADVISOR" || call.ToolArg != "[claude-fable-5]" {
+		t.Fatalf("expected an advisor tool call labeled with the model, got %#v", call)
 	}
-	// The advice is encrypted, so the result placeholder names the advisor model
-	// (from the record's top-level advisorModel) instead of the plaintext.
-	if result == nil || result.Text != "[advisor: claude-fable-5 (redacted)]" {
-		t.Fatalf("expected a model-named redacted advisor result, got %#v", result)
+	if call.ToolDetail != "redacted advice" {
+		t.Fatalf("expected a redacted-advice detail, got %q", call.ToolDetail)
+	}
+}
+
+// A successful advisor call records the advisor's token usage (forwarded
+// context in, advice out) from the message usage's advisor_message iteration,
+// since the advice text is encrypted.
+func TestParseAdvisorResultTokens(t *testing.T) {
+	d := t.TempDir()
+	src := filepath.Join(d, "s.jsonl")
+	data := []byte(`{"uuid":"a","timestamp":"2026-01-01T00:00:00Z","advisorModel":"claude-fable-5","message":{"role":"assistant","usage":{"iterations":[{"type":"message","input_tokens":10},{"type":"advisor_message","input_tokens":37923,"output_tokens":1046}]},"content":[{"type":"advisor_tool_result","tool_use_id":"srv1","content":{"type":"advisor_redacted_result","encrypted_content":"ErMI..."}}]}}` + "\n")
+	if err := os.WriteFile(src, data, 0600); err != nil {
+		t.Fatal(err)
+	}
+	ev, _, _, _, _, _, _, _ := parse(context.Background(), src)
+	call := findKind(ev, domain.EventToolCall)
+	if call == nil || call.ToolArg != "[claude-fable-5]" || call.ToolDetail != "redacted advice · 37923→1046 tok" {
+		t.Fatalf("expected an advisor call with token usage, got %#v", call)
+	}
+}
+
+// A failed advisor call carries content.type advisor_tool_result_error. The
+// record still sets advisorModel, so the error must be detected first — otherwise
+// it would render as a redacted success and hide the failure. The call is
+// labeled with the model too; the error code lives in the detail.
+func TestParseAdvisorToolResultError(t *testing.T) {
+	d := t.TempDir()
+	src := filepath.Join(d, "s.jsonl")
+	data := []byte(`{"uuid":"a","timestamp":"2026-01-01T00:00:00Z","advisorModel":"claude-fable-5","message":{"role":"assistant","content":[{"type":"server_tool_use","id":"srv1","name":"advisor","input":{}},{"type":"advisor_tool_result","tool_use_id":"srv1","content":{"type":"advisor_tool_result_error","error_code":"unavailable"}}]}}` + "\n")
+	if err := os.WriteFile(src, data, 0600); err != nil {
+		t.Fatal(err)
+	}
+	ev, _, _, _, _, _, _, _ := parse(context.Background(), src)
+	call := findKind(ev, domain.EventToolCall)
+	if call == nil || call.ToolName != "ADVISOR" || call.ToolArg != "[claude-fable-5]" {
+		t.Fatalf("expected an advisor error call labeled with the model, got %#v", call)
+	}
+	if call.ToolDetail != "advisor call failed (unavailable)" {
+		t.Fatalf("expected a failure detail, got %q", call.ToolDetail)
 	}
 }
 
@@ -461,6 +503,70 @@ func TestLoadConversationCyclicParentTerminates(t *testing.T) {
 	case <-done:
 	case <-time.After(3 * time.Second):
 		t.Fatal("LoadConversation did not terminate on a cyclic transcript")
+	}
+}
+
+// A user can queue a "! command" while one is running; Claude later writes it as
+// a real <bash-input> record. The queued copy's text is bare ("git ...") while the
+// executed record wraps it ("<bash-input>git ...</bash-input>"), so the old raw-text
+// dedup missed it and the queued copy lingered as a phantom ▶ on the wrong turn.
+// It must be deduped against the normalized command; an unrelated queued message
+// must still survive.
+func TestAttachQueuedDedupsExecutedCommand(t *testing.T) {
+	d := t.TempDir()
+	src := filepath.Join(d, "s.jsonl")
+	data := []byte(
+		`{"uuid":"u1","parentUuid":null,"timestamp":"2026-01-01T00:00:00Z","type":"user","message":{"role":"user","content":[{"type":"text","text":"do it"}]}}` + "\n" +
+			`{"uuid":"a1","parentUuid":"u1","timestamp":"2026-01-01T00:00:01Z","type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"ok"}]}}` + "\n" +
+			`{"uuid":"b1","parentUuid":"a1","timestamp":"2026-01-01T00:00:03Z","type":"user","message":{"role":"user","content":"<bash-input>git push origin v0.5.0</bash-input>"}}` + "\n" +
+			`{"type":"queue-operation","operation":"enqueue","content":"git push origin v0.5.0","timestamp":"2026-01-01T00:00:02Z"}` + "\n" +
+			`{"type":"queue-operation","operation":"enqueue","content":"an unrelated queued note","timestamp":"2026-01-01T00:00:02Z"}` + "\n")
+	if err := os.WriteFile(src, data, 0600); err != nil {
+		t.Fatal(err)
+	}
+	p := &Plugin{}
+	c, err := p.LoadConversation(context.Background(), domain.SessionRef{Source: src})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var queued []string
+	for _, id := range c.ActivePath() {
+		for _, e := range c.Nodes[id].Events {
+			if e.Kind == domain.EventQueued {
+				queued = append(queued, e.Text)
+			}
+		}
+	}
+	// The executed "! git push origin v0.5.0" must be deduped; only the unrelated
+	// note (which never ran) survives as a queued event.
+	if len(queued) != 1 || queued[0] != "an unrelated queued note" {
+		t.Fatalf("expected only the unrelated queued message to survive, got %#v", queued)
+	}
+}
+
+// A "!" shell command is a genuine user action, judged like any user message:
+// it opens its own turn (Command boundary), separate from the preceding prompt.
+func TestBashCommandOpensItsOwnTurn(t *testing.T) {
+	d := t.TempDir()
+	src := filepath.Join(d, "s.jsonl")
+	data := []byte(
+		`{"uuid":"u1","parentUuid":null,"timestamp":"2026-01-01T00:00:00Z","type":"user","message":{"role":"user","content":[{"type":"text","text":"do it"}]}}` + "\n" +
+			`{"uuid":"a1","parentUuid":"u1","timestamp":"2026-01-01T00:00:01Z","type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"ok"}]}}` + "\n" +
+			`{"uuid":"b1","parentUuid":"a1","timestamp":"2026-01-01T00:00:02Z","type":"user","message":{"role":"user","content":"<bash-input>git status</bash-input>"}}` + "\n")
+	if err := os.WriteFile(src, data, 0600); err != nil {
+		t.Fatal(err)
+	}
+	p := &Plugin{}
+	c, err := p.LoadConversation(context.Background(), domain.SessionRef{Source: src})
+	if err != nil {
+		t.Fatal(err)
+	}
+	turns := conversation.TurnsOfPath(*c, conversation.DeepestPath(*c, c.Roots[0]))
+	if len(turns) != 2 {
+		t.Fatalf("a ! command must open its own turn: got %d turns, want 2", len(turns))
+	}
+	if hl := conversation.TurnHeadline(*c, turns[1]); hl != "! git status" {
+		t.Fatalf("second turn headline = %q, want the shell command", hl)
 	}
 }
 

@@ -46,7 +46,12 @@ func (Factory) Descriptor() plugin.Descriptor {
 	// server_tool_use become EventToolCall, and advisor_tool_result becomes an EventToolResult
 	// placeholder naming the advisor model ("[advisor: <model> (redacted)]"); previously these
 	// blocks were silently dropped from the turn.
-	return plugin.Descriptor{Type: "claude", DisplayName: "Claude", ParserVersion: "9", Capabilities: domain.Capabilities{Scan: true, Conversation: true, Active: true, Resume: true, Rewind: true, Relocate: true}}
+	// ParserVersion=10: advisor calls (server_tool_use "advisor" + advisor_tool_result) fold into a
+	// single EventToolCall labeled "ADVISOR [<model>]" (both success and failure) instead of the
+	// two-block ◆ call + └ result pair. The advice is encrypted, so the detail carries the token
+	// usage (from the advisor_message iteration) on success or the failure code on error. This also
+	// fixes a failed call being mislabeled as a redacted success (advisorModel is set even on error).
+	return plugin.Descriptor{Type: "claude", DisplayName: "Claude", ParserVersion: "10", Capabilities: domain.Capabilities{Scan: true, Conversation: true, Active: true, Resume: true, Rewind: true, Relocate: true}}
 }
 
 func (Factory) New(id string, n *yaml.Node) (any, error) {
@@ -249,9 +254,13 @@ func messageEvents(msg map[string]any, ts time.Time, advisorModel string) []doma
 			tool = common.String(m["name"])
 			text = common.Text(m["input"])
 		case "server_tool_use":
-			// Server-side tools (advisor, web_search, web_fetch) record their
-			// invocation under this type instead of "tool_use". Surface it as a
-			// tool call so it is not silently dropped from the turn.
+			// Server-side tools (web_search, web_fetch) record their invocation
+			// under this type instead of "tool_use"; surface them as tool calls.
+			// advisor is rendered as a task from its result block, so its (empty)
+			// call is skipped here to avoid a redundant ◆ block.
+			if common.String(m["name"]) == "advisor" {
+				continue
+			}
 			k = domain.EventToolCall
 			tool = common.String(m["name"])
 			text = common.Text(m["input"])
@@ -264,16 +273,13 @@ func messageEvents(msg map[string]any, ts time.Time, advisorModel string) []doma
 				text = nonTextSummary(m["content"])
 			}
 		case "advisor_tool_result":
-			// The advisor returns its advice encrypted (advisor_redacted_result)
-			// with no plaintext, so render a placeholder naming the model that
-			// advised rather than dumping the encrypted blob. content is a single
-			// object here, not a list.
-			k = domain.EventToolResult
-			if advisorModel != "" {
-				text = "[advisor: " + advisorModel + " (redacted)]"
-			} else {
-				text = nonTextSummary([]any{m["content"]})
-			}
+			// Fold the advisor call and its result into one tool-call block: the
+			// call input is empty and the advice is encrypted, so a separate result
+			// block adds nothing. The detail carries the model and token usage, or
+			// the error code on a failed call.
+			in, out := advisorTokens(msg)
+			es = append(es, advisorCallEvent(m["content"], advisorModel, in, out, ts))
+			continue
 		}
 		if k != domain.EventMeta {
 			es = append(es, domain.Event{Kind: k, Text: text, Timestamp: ts, ToolName: tool, RawType: bt})
@@ -303,6 +309,65 @@ func nonTextSummary(v any) string {
 		}
 	}
 	return strings.Join(lines, "\n")
+}
+
+// advisorTokens returns the advisor's forwarded-context (in) and advice (out)
+// token counts from the message usage's advisor_message iteration. Both are 0
+// when absent, e.g. a failed call records no advisor generation.
+func advisorTokens(msg map[string]any) (in, out int) {
+	for _, it := range common.Slice(common.Map(msg["usage"])["iterations"]) {
+		m := common.Map(it)
+		if common.String(m["type"]) == "advisor_message" {
+			return jsonInt(m["input_tokens"]), jsonInt(m["output_tokens"])
+		}
+	}
+	return 0, 0
+}
+
+// jsonInt reads a numeric JSON value as an int, tolerating both the json.Number
+// form (UnmarshalJSONMap uses UseNumber) and the float64 form (plain Unmarshal).
+func jsonInt(v any) int {
+	switch n := v.(type) {
+	case json.Number:
+		i, _ := n.Int64()
+		return int(i)
+	case float64:
+		return int(n)
+	}
+	return 0
+}
+
+// advisorCallEvent renders an advisor invocation as a single tool-call block.
+// advisor is a tool, so it stays an EventToolCall (not an EventTask); its call
+// input is empty and its result carries no plaintext, so the call and result
+// are folded into one event rather than a ◆ call + └ result pair. ToolName is
+// upper-cased ("ADVISOR") so the block stands out from ordinary tools; ToolArg
+// always names the advising model, and ToolDetail records the token usage on
+// success or the failure (with its error code) on error. content is the
+// advisor_tool_result's content object.
+func advisorCallEvent(content any, model string, in, out int, ts time.Time) domain.Event {
+	e := domain.Event{Kind: domain.EventToolCall, ToolName: "ADVISOR", Timestamp: ts, RawType: "advisor_tool_result"}
+	inner := common.Map(content)
+	if common.String(inner["type"]) == "advisor_tool_result_error" {
+		code := common.String(inner["error_code"])
+		if code == "" {
+			code = "error"
+		}
+		label := model
+		if label == "" {
+			label = code
+		}
+		e.ToolArg = "[" + label + "]"
+		e.ToolDetail = "advisor call failed (" + code + ")"
+		return e
+	}
+	e.ToolArg = "[" + model + "]"
+	if out > 0 {
+		e.ToolDetail = fmt.Sprintf("redacted advice · %d→%d tok", in, out)
+	} else {
+		e.ToolDetail = "redacted advice"
+	}
+	return e
 }
 
 // systemEvents surfaces the system records that carry conversation content:
@@ -446,11 +511,25 @@ func attachQueued(c *domain.Conversation, queued []domain.Event) {
 	}
 	norm := func(s string) string { return strings.Join(strings.Fields(s), " ") }
 	real := map[string]bool{}
+	add := func(s string) {
+		if s = norm(s); s != "" {
+			real[s] = true
+		}
+	}
 	for _, id := range path {
 		for _, e := range c.Nodes[id].Events {
-			if e.Kind == domain.EventUser && e.Text != "" {
-				real[norm(e.Text)] = true
+			if e.Kind != domain.EventUser {
+				continue
 			}
+			// A queued message carries the bare text the user typed, but the record
+			// that later executes it is normalized: a prompt loses its system-reminder
+			// cruft and a "! cmd" is recorded wrapped in <bash-input>. Match against
+			// the normalized Prompt and Command too — not just the raw Text — so a
+			// queued prompt or command that actually ran is deduped instead of
+			// lingering as a phantom ▶.
+			add(e.Text)
+			add(e.Prompt)
+			add(strings.TrimPrefix(e.Command, "! "))
 		}
 	}
 	for _, q := range queued {
