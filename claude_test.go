@@ -292,6 +292,37 @@ func TestParseToolResultNonTextPlaceholder(t *testing.T) {
 	}
 }
 
+// The advisor is invoked as a server-side tool: its call is a server_tool_use
+// block and its (encrypted) advice comes back as advisor_tool_result. Both must
+// surface in the turn — a tool call plus a redacted result placeholder — rather
+// than being silently dropped.
+func TestParseAdvisorServerToolBlocks(t *testing.T) {
+	d := t.TempDir()
+	src := filepath.Join(d, "s.jsonl")
+	data := []byte(`{"uuid":"a","timestamp":"2026-01-01T00:00:00Z","advisorModel":"claude-fable-5","message":{"role":"assistant","content":[{"type":"server_tool_use","id":"srv1","name":"advisor","input":{}},{"type":"advisor_tool_result","tool_use_id":"srv1","content":{"type":"advisor_redacted_result","encrypted_content":"ErMI..."}}]}}` + "\n")
+	if err := os.WriteFile(src, data, 0600); err != nil {
+		t.Fatal(err)
+	}
+	ev, _, _, _, _, _, _, _ := parse(context.Background(), src)
+	var call, result *domain.Event
+	for i := range ev {
+		switch ev[i].Kind {
+		case domain.EventToolCall:
+			call = &ev[i]
+		case domain.EventToolResult:
+			result = &ev[i]
+		}
+	}
+	if call == nil || call.ToolName != "advisor" {
+		t.Fatalf("expected an advisor tool call, got %#v", ev)
+	}
+	// The advice is encrypted, so the result placeholder names the advisor model
+	// (from the record's top-level advisorModel) instead of the plaintext.
+	if result == nil || result.Text != "[advisor: claude-fable-5 (redacted)]" {
+		t.Fatalf("expected a model-named redacted advisor result, got %#v", result)
+	}
+}
+
 // away_summary system records carry the recap of what the agent did while the
 // user was away; they surface as assistant text like Claude Code shows them.
 func TestParseSystemAwaySummary(t *testing.T) {

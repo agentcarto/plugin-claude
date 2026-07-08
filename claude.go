@@ -42,7 +42,11 @@ func (Factory) Descriptor() plugin.Descriptor {
 	// notifications become EventTask (agent-specific rendering moved out of the host).
 	// ParserVersion=8: command labels include <command-args> and user file/directory
 	// attachments become EventAttachment.
-	return plugin.Descriptor{Type: "claude", DisplayName: "Claude", ParserVersion: "8", Capabilities: domain.Capabilities{Scan: true, Conversation: true, Active: true, Resume: true, Rewind: true, Relocate: true}}
+	// ParserVersion=9: server-side tool calls (advisor, web_search, web_fetch) recorded as
+	// server_tool_use become EventToolCall, and advisor_tool_result becomes an EventToolResult
+	// placeholder naming the advisor model ("[advisor: <model> (redacted)]"); previously these
+	// blocks were silently dropped from the turn.
+	return plugin.Descriptor{Type: "claude", DisplayName: "Claude", ParserVersion: "9", Capabilities: domain.Capabilities{Scan: true, Conversation: true, Active: true, Resume: true, Rewind: true, Relocate: true}}
 }
 
 func (Factory) New(id string, n *yaml.Node) (any, error) {
@@ -211,9 +215,11 @@ func userOrAssistant(role string) domain.EventKind {
 }
 
 // messageEvents converts a single message's content blocks into display events. A content block
-// may be a bare string or a typed object (text/thinking/tool_use/tool_result); blocks of an
-// unknown type produce no event.
-func messageEvents(msg map[string]any, ts time.Time) []domain.Event {
+// may be a bare string or a typed object (text/thinking/tool_use/tool_result, plus the server-side
+// server_tool_use/advisor_tool_result variants); blocks of an unknown type produce no event.
+// advisorModel is the record's top-level advisorModel field (empty when absent), used to label the
+// otherwise-redacted advisor result.
+func messageEvents(msg map[string]any, ts time.Time, advisorModel string) []domain.Event {
 	role := common.String(msg["role"])
 	var es []domain.Event
 	for _, b := range common.Slice(msg["content"]) {
@@ -242,6 +248,13 @@ func messageEvents(msg map[string]any, ts time.Time) []domain.Event {
 			k = domain.EventToolCall
 			tool = common.String(m["name"])
 			text = common.Text(m["input"])
+		case "server_tool_use":
+			// Server-side tools (advisor, web_search, web_fetch) record their
+			// invocation under this type instead of "tool_use". Surface it as a
+			// tool call so it is not silently dropped from the turn.
+			k = domain.EventToolCall
+			tool = common.String(m["name"])
+			text = common.Text(m["input"])
 		case "tool_result":
 			k = domain.EventToolResult
 			text = common.Text(m["content"])
@@ -249,6 +262,17 @@ func messageEvents(msg map[string]any, ts time.Time) []domain.Event {
 			// there instead of showing an empty result.
 			if strings.TrimSpace(text) == "" {
 				text = nonTextSummary(m["content"])
+			}
+		case "advisor_tool_result":
+			// The advisor returns its advice encrypted (advisor_redacted_result)
+			// with no plaintext, so render a placeholder naming the model that
+			// advised rather than dumping the encrypted blob. content is a single
+			// object here, not a list.
+			k = domain.EventToolResult
+			if advisorModel != "" {
+				text = "[advisor: " + advisorModel + " (redacted)]"
+			} else {
+				text = nonTextSummary([]any{m["content"]})
 			}
 		}
 		if k != domain.EventMeta {
@@ -367,7 +391,7 @@ func parse(ctx context.Context, path string) (ev []domain.Event, nodes []domain.
 		meta, _ := o["isMeta"].(bool)
 		var es []domain.Event
 		if !meta {
-			es = messageEvents(msg, ts)
+			es = messageEvents(msg, ts, common.String(o["advisorModel"]))
 			switch common.String(o["type"]) {
 			case "system":
 				es = append(es, systemEvents(o, ts)...)
