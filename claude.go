@@ -51,7 +51,15 @@ func (Factory) Descriptor() plugin.Descriptor {
 	// two-block ◆ call + └ result pair. The advice is encrypted, so the detail carries the token
 	// usage (from the advisor_message iteration) on success or the failure code on error. This also
 	// fixes a failed call being mislabeled as a redacted success (advisorModel is set even on error).
-	return plugin.Descriptor{Type: "claude", DisplayName: "Claude", ParserVersion: "10", Capabilities: domain.Capabilities{Scan: true, Conversation: true, Active: true, Resume: true, Rewind: true, Relocate: true}}
+	// ParserVersion=11: thinking blocks whose plaintext the agent never recorded (encrypted into
+	// signature, or redacted_thinking) become a redacted EventReasoning placeholder instead of being
+	// dropped; redacted_thinking is now recognized at all. Newer models omit the thinking text by
+	// default, so previously every Claude turn showed no ◇ block whatsoever. The placeholder mirrors
+	// an advisor call: "[redacted]" as the label argument, and one detail line carrying the ciphertext
+	// size and the tokens generated — the only measurements the log offers. Advisor results gain the
+	// same ciphertext size (from encrypted_content) and drop their forwarded-context token count,
+	// which tracked the conversation's length rather than the call.
+	return plugin.Descriptor{Type: "claude", DisplayName: "Claude", ParserVersion: "11", Capabilities: domain.Capabilities{Scan: true, Conversation: true, Active: true, Resume: true, Rewind: true, Relocate: true}}
 }
 
 func (Factory) New(id string, n *yaml.Node) (any, error) {
@@ -240,13 +248,20 @@ func messageEvents(msg map[string]any, ts time.Time, advisorModel string) []doma
 		switch bt {
 		case "text":
 			k = userOrAssistant(role)
-		case "thinking":
+		case "thinking", "redacted_thinking":
 			k = domain.EventReasoning
 			text = common.String(m["thinking"])
 			// Newer models encrypt the thinking into the signature and leave the
-			// thinking text empty (display:"omitted"). Skip such blocks instead of
-			// rendering a blank reasoning event.
+			// thinking text empty (display:"omitted"); redacted_thinking never
+			// carries plaintext either. The reasoning happened, so surface it as a
+			// redacted placeholder (like advisor) rather than dropping the block.
+			// A block with neither ciphertext nor text is genuinely empty: skip it.
 			if strings.TrimSpace(text) == "" {
+				cipher := common.String(m["signature"]) + common.String(m["data"])
+				if cipher == "" {
+					continue
+				}
+				es = append(es, redactedThinkingEvent(len(cipher), responseTokens(msg), ts, bt))
 				continue
 			}
 		case "tool_use":
@@ -275,10 +290,9 @@ func messageEvents(msg map[string]any, ts time.Time, advisorModel string) []doma
 		case "advisor_tool_result":
 			// Fold the advisor call and its result into one tool-call block: the
 			// call input is empty and the advice is encrypted, so a separate result
-			// block adds nothing. The detail carries the model and token usage, or
-			// the error code on a failed call.
-			in, out := advisorTokens(msg)
-			es = append(es, advisorCallEvent(m["content"], advisorModel, in, out, ts))
+			// block adds nothing. The detail carries the ciphertext size and the
+			// tokens generated, or the error code on a failed call.
+			es = append(es, advisorCallEvent(m["content"], advisorModel, advisorTokens(msg), ts))
 			continue
 		}
 		if k != domain.EventMeta {
@@ -311,17 +325,65 @@ func nonTextSummary(v any) string {
 	return strings.Join(lines, "\n")
 }
 
-// advisorTokens returns the advisor's forwarded-context (in) and advice (out)
-// token counts from the message usage's advisor_message iteration. Both are 0
-// when absent, e.g. a failed call records no advisor generation.
-func advisorTokens(msg map[string]any) (in, out int) {
+// redactedThinkingEvent renders a thinking block whose plaintext the agent never
+// wrote to the log. The reasoning is encrypted into the block's signature (or
+// data, for redacted_thinking) and only Anthropic's servers can decrypt it, so
+// the event carries no Text: ToolArg marks it redacted and ToolDetail explains
+// why the body is missing, mirroring how an advisor call renders its encrypted
+// advice.
+//
+// Two measurements stand in for the missing body. cipherBytes is the ciphertext
+// size, which grows with the amount of reasoning and is the only per-block signal
+// available. respTokens is the enclosing response's output_tokens: it describes
+// the response, not this block, since the API reports no per-block breakdown and
+// the log copies one response's usage onto every block it produced. Only the
+// output side is shown — the input side is the conversation's context length,
+// which merely grows turn by turn and says nothing about this block.
+func redactedThinkingEvent(cipherBytes, respTokens int, ts time.Time, rawType string) domain.Event {
+	e := domain.Event{
+		Kind:      domain.EventReasoning,
+		ToolArg:   "[redacted]",
+		Timestamp: ts,
+		RawType:   rawType,
+	}
+	e.ToolDetail = "redacted thinking · " + humanBytes(cipherBytes)
+	if respTokens > 0 {
+		e.ToolDetail += fmt.Sprintf(" · %d tok", respTokens)
+	}
+	return e
+}
+
+// responseTokens returns the output_tokens of the response this block belongs to.
+// It covers every content block the response produced, not just this one.
+func responseTokens(msg map[string]any) int {
+	return jsonInt(common.Map(msg["usage"])["output_tokens"])
+}
+
+// humanBytes renders a ciphertext size as "980 B", "4.2 KB" or "1.3 MB".
+func humanBytes(n int) string {
+	switch {
+	case n < 1024:
+		return fmt.Sprintf("%d B", n)
+	case n < 1024*1024:
+		return fmt.Sprintf("%.1f KB", float64(n)/1024)
+	default:
+		return fmt.Sprintf("%.1f MB", float64(n)/(1024*1024))
+	}
+}
+
+// advisorTokens returns the tokens the advisor generated, from the message
+// usage's advisor_message iteration. It is 0 when absent, e.g. a failed call
+// records no advisor generation. The iteration's input_tokens (the forwarded
+// context) is deliberately not surfaced: like a thinking block's input side, it
+// tracks the conversation's length rather than this call.
+func advisorTokens(msg map[string]any) (out int) {
 	for _, it := range common.Slice(common.Map(msg["usage"])["iterations"]) {
 		m := common.Map(it)
 		if common.String(m["type"]) == "advisor_message" {
-			return jsonInt(m["input_tokens"]), jsonInt(m["output_tokens"])
+			return jsonInt(m["output_tokens"])
 		}
 	}
-	return 0, 0
+	return 0
 }
 
 // jsonInt reads a numeric JSON value as an int, tolerating both the json.Number
@@ -342,10 +404,12 @@ func jsonInt(v any) int {
 // input is empty and its result carries no plaintext, so the call and result
 // are folded into one event rather than a ◆ call + └ result pair. ToolName is
 // upper-cased ("ADVISOR") so the block stands out from ordinary tools; ToolArg
-// always names the advising model, and ToolDetail records the token usage on
-// success or the failure (with its error code) on error. content is the
-// advisor_tool_result's content object.
-func advisorCallEvent(content any, model string, in, out int, ts time.Time) domain.Event {
+// always names the advising model, and ToolDetail records the ciphertext size
+// and token usage on success or the failure (with its error code) on error.
+// content is the advisor_tool_result's content object, whose encrypted_content
+// holds the advice — its size is the only measure of how much was said, just as
+// a redacted thinking block is measured by its signature.
+func advisorCallEvent(content any, model string, out int, ts time.Time) domain.Event {
 	e := domain.Event{Kind: domain.EventToolCall, ToolName: "ADVISOR", Timestamp: ts, RawType: "advisor_tool_result"}
 	inner := common.Map(content)
 	if common.String(inner["type"]) == "advisor_tool_result_error" {
@@ -362,10 +426,12 @@ func advisorCallEvent(content any, model string, in, out int, ts time.Time) doma
 		return e
 	}
 	e.ToolArg = "[" + model + "]"
+	e.ToolDetail = "redacted advice"
+	if c := common.String(inner["encrypted_content"]); c != "" {
+		e.ToolDetail += " · " + humanBytes(len(c))
+	}
 	if out > 0 {
-		e.ToolDetail = fmt.Sprintf("redacted advice · %d→%d tok", in, out)
-	} else {
-		e.ToolDetail = "redacted advice"
+		e.ToolDetail += fmt.Sprintf(" · %d tok", out)
 	}
 	return e
 }

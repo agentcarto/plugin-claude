@@ -10,6 +10,7 @@ import (
 	"github.com/agentcarto/core/transaction"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -221,22 +222,60 @@ func TestParseContentListStringBlock(t *testing.T) {
 	}
 }
 
-func TestParseSkipsEmptyThinkingBlock(t *testing.T) {
+// Thinking whose plaintext was never logged still produces a reasoning event, as
+// a redacted placeholder: the ciphertext (signature, or data for
+// redacted_thinking) proves the model reasoned there. Only a block with neither
+// text nor ciphertext is dropped.
+func TestParseRedactsEncryptedThinkingBlock(t *testing.T) {
 	d := t.TempDir()
 	src := filepath.Join(d, "s.jsonl")
-	data := []byte(`{"uuid":"a","timestamp":"2026-01-01T00:00:00Z","message":{"role":"assistant","content":[{"type":"thinking","thinking":"","signature":"sig"},{"type":"thinking","thinking":"real thought"},{"type":"text","text":"answer"}]}}` + "\n")
+	data := []byte(`{"uuid":"a","timestamp":"2026-01-01T00:00:00Z","message":{"role":"assistant","usage":{"input_tokens":100,"cache_read_input_tokens":20,"cache_creation_input_tokens":5,"output_tokens":948},"content":[{"type":"thinking","thinking":"","signature":"` + strings.Repeat("x", 2048) + `"},{"type":"redacted_thinking","data":"ciphertext"},{"type":"thinking","thinking":""},{"type":"thinking","thinking":"real thought"},{"type":"text","text":"answer"}]}}` + "\n")
 	if err := os.WriteFile(src, data, 0600); err != nil {
 		t.Fatal(err)
 	}
 	ev, _, _, _, _, _, _, _ := parse(context.Background(), src)
-	var reasoning []string
+	var reasoning []domain.Event
 	for _, e := range ev {
 		if e.Kind == domain.EventReasoning {
-			reasoning = append(reasoning, e.Text)
+			reasoning = append(reasoning, e)
 		}
 	}
-	if len(reasoning) != 1 || reasoning[0] != "real thought" {
-		t.Fatalf("expected only the non-empty thinking block, got %#v", reasoning)
+	if len(reasoning) != 3 {
+		t.Fatalf("expected 2 redacted + 1 plaintext reasoning events, got %#v", reasoning)
+	}
+	for i, want := range []string{"thinking", "redacted_thinking"} {
+		if reasoning[i].Text != "" || reasoning[i].RawType != want {
+			t.Fatalf("block %d should be a redacted placeholder with RawType %q: %#v", i, want, reasoning[i])
+		}
+		// Like an advisor call: the identifier lives in ToolArg, the detail in one line.
+		if reasoning[i].ToolArg != "[redacted]" {
+			t.Fatalf("block %d ToolArg = %q", i, reasoning[i].ToolArg)
+		}
+		// Only the output side: the response's input tokens track the context length.
+		if !strings.HasSuffix(reasoning[i].ToolDetail, "· 948 tok") {
+			t.Fatalf("block %d ToolDetail = %q, want the response output tokens", i, reasoning[i].ToolDetail)
+		}
+	}
+	// Ciphertext size comes from the block, not the message: 2048 B vs 10 B.
+	if !strings.HasPrefix(reasoning[0].ToolDetail, "redacted thinking · 2.0 KB") {
+		t.Fatalf("signature size not reported: %q", reasoning[0].ToolDetail)
+	}
+	if !strings.HasPrefix(reasoning[1].ToolDetail, "redacted thinking · 10 B") {
+		t.Fatalf("redacted_thinking data size not reported: %q", reasoning[1].ToolDetail)
+	}
+	if reasoning[2].Text != "real thought" || reasoning[2].ToolArg != "" {
+		t.Fatalf("plaintext thinking should stay as-is: %#v", reasoning[2])
+	}
+}
+
+func TestHumanBytes(t *testing.T) {
+	for _, c := range []struct {
+		n    int
+		want string
+	}{{0, "0 B"}, {980, "980 B"}, {1023, "1023 B"}, {1024, "1.0 KB"}, {4301, "4.2 KB"}, {235256, "229.7 KB"}, {1 << 21, "2.0 MB"}} {
+		if got := humanBytes(c.n); got != c.want {
+			t.Fatalf("humanBytes(%d)=%q want %q", c.n, got, c.want)
+		}
 	}
 }
 
@@ -310,7 +349,7 @@ func findKind(ev []domain.Event, k domain.EventKind) *domain.Event {
 func TestParseAdvisorServerToolBlocks(t *testing.T) {
 	d := t.TempDir()
 	src := filepath.Join(d, "s.jsonl")
-	data := []byte(`{"uuid":"a","timestamp":"2026-01-01T00:00:00Z","advisorModel":"claude-fable-5","message":{"role":"assistant","content":[{"type":"server_tool_use","id":"srv1","name":"advisor","input":{}},{"type":"advisor_tool_result","tool_use_id":"srv1","content":{"type":"advisor_redacted_result","encrypted_content":"ErMI..."}}]}}` + "\n")
+	data := []byte(`{"uuid":"a","timestamp":"2026-01-01T00:00:00Z","advisorModel":"claude-fable-5","message":{"role":"assistant","content":[{"type":"server_tool_use","id":"srv1","name":"advisor","input":{}},{"type":"advisor_tool_result","tool_use_id":"srv1","content":{"type":"advisor_redacted_result","encrypted_content":"` + strings.Repeat("x", 1440) + `"}}]}}` + "\n")
 	if err := os.WriteFile(src, data, 0600); err != nil {
 		t.Fatal(err)
 	}
@@ -322,25 +361,27 @@ func TestParseAdvisorServerToolBlocks(t *testing.T) {
 	if call == nil || call.ToolName != "ADVISOR" || call.ToolArg != "[claude-fable-5]" {
 		t.Fatalf("expected an advisor tool call labeled with the model, got %#v", call)
 	}
-	if call.ToolDetail != "redacted advice" {
+	// No usage iteration here, so only the ciphertext size is reported.
+	if call.ToolDetail != "redacted advice · 1.4 KB" {
 		t.Fatalf("expected a redacted-advice detail, got %q", call.ToolDetail)
 	}
 }
 
-// A successful advisor call records the advisor's token usage (forwarded
-// context in, advice out) from the message usage's advisor_message iteration,
-// since the advice text is encrypted.
+// A successful advisor call records the tokens the advisor generated, from the
+// message usage's advisor_message iteration, since the advice text is encrypted.
+// Its ciphertext size precedes the tokens, matching how a redacted thinking block
+// reports its signature size. The iteration's input_tokens is not shown.
 func TestParseAdvisorResultTokens(t *testing.T) {
 	d := t.TempDir()
 	src := filepath.Join(d, "s.jsonl")
-	data := []byte(`{"uuid":"a","timestamp":"2026-01-01T00:00:00Z","advisorModel":"claude-fable-5","message":{"role":"assistant","usage":{"iterations":[{"type":"message","input_tokens":10},{"type":"advisor_message","input_tokens":37923,"output_tokens":1046}]},"content":[{"type":"advisor_tool_result","tool_use_id":"srv1","content":{"type":"advisor_redacted_result","encrypted_content":"ErMI..."}}]}}` + "\n")
+	data := []byte(`{"uuid":"a","timestamp":"2026-01-01T00:00:00Z","advisorModel":"claude-fable-5","message":{"role":"assistant","usage":{"iterations":[{"type":"message","input_tokens":10},{"type":"advisor_message","input_tokens":37923,"output_tokens":1046}]},"content":[{"type":"advisor_tool_result","tool_use_id":"srv1","content":{"type":"advisor_redacted_result","encrypted_content":"` + strings.Repeat("x", 1440) + `"}}]}}` + "\n")
 	if err := os.WriteFile(src, data, 0600); err != nil {
 		t.Fatal(err)
 	}
 	ev, _, _, _, _, _, _, _ := parse(context.Background(), src)
 	call := findKind(ev, domain.EventToolCall)
-	if call == nil || call.ToolArg != "[claude-fable-5]" || call.ToolDetail != "redacted advice · 37923→1046 tok" {
-		t.Fatalf("expected an advisor call with token usage, got %#v", call)
+	if call == nil || call.ToolArg != "[claude-fable-5]" || call.ToolDetail != "redacted advice · 1.4 KB · 1046 tok" {
+		t.Fatalf("expected an advisor call with size and token usage, got %#v", call)
 	}
 }
 
