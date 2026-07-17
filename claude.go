@@ -770,8 +770,7 @@ func (p *Plugin) DetectActive(_ context.Context, ss []domain.Session, ps []domai
 	}
 	// pid match: ~/.claude/sessions/<pid>.json authoritatively maps pid to sessionId. A session
 	// whose pid matches a live process is considered active (same shape as grok's
-	// active_sessions.json). Unlike cwd approximation, this never confuses two sessions sharing a
-	// cwd.
+	// active_sessions.json). The direct mapping does not confuse sessions that share a cwd.
 	pidMatched := map[string]bool{}
 	for _, pr := range ps {
 		if sid, ok := pidToSession[pr.PID]; ok {
@@ -788,11 +787,15 @@ func (p *Plugin) DetectActive(_ context.Context, ss []domain.Session, ps []domai
 			shellRunning[sid] = true
 		}
 	}
-	// cwd approximation: the most recent session whose cwd matches a claude process is also
-	// treated as active. Processes already resolved by pid are excluded to avoid misattribution.
+	// CWD is only a fallback for terminal-launched Claude processes. IDE services can share a
+	// project CWD while no conversation is active, so processes without a shell ancestor are ignored.
 	cwdMatched := map[string]bool{}
+	processByPID := make(map[int32]domain.Process, len(ps))
 	for _, pr := range ps {
-		if pr.CWD == "" || !isClaudeProcess(pr) {
+		processByPID[pr.PID] = pr
+	}
+	for _, pr := range ps {
+		if pr.CWD == "" || !isClaudeProcess(pr) || !hasShellAncestor(pr, processByPID) {
 			continue
 		}
 		if _, known := pidToSession[pr.PID]; known {
@@ -841,12 +844,31 @@ func (p *Plugin) DetectActive(_ context.Context, ss []domain.Session, ps []domai
 }
 
 // shellNames lists the executable basenames Claude Code uses to run its Bash tool.
-var shellNames = map[string]bool{"sh": true, "bash": true, "zsh": true, "fish": true, "dash": true, "ksh": true}
+var shellNames = map[string]bool{
+	"sh": true, "bash": true, "zsh": true, "fish": true, "dash": true, "ksh": true,
+	"cmd": true, "cmd.exe": true, "powershell": true, "powershell.exe": true, "pwsh": true, "pwsh.exe": true,
+}
 
 // isShellProcess reports whether a process is an interactive shell (used to detect a Bash tool's
 // child shell still running under a claude session).
 func isShellProcess(p domain.Process) bool {
-	return shellNames[filepath.Base(p.Executable)]
+	return shellNames[strings.ToLower(filepath.Base(p.Executable))]
+}
+
+func hasShellAncestor(pr domain.Process, processByPID map[int32]domain.Process) bool {
+	seen := map[int32]bool{}
+	for ppid := pr.PPID; ppid != 0 && !seen[ppid]; {
+		seen[ppid] = true
+		parent, ok := processByPID[ppid]
+		if !ok {
+			return false
+		}
+		if isShellProcess(parent) {
+			return true
+		}
+		ppid = parent.PPID
+	}
+	return false
 }
 
 func (p *Plugin) PlanFork(_ context.Context, s domain.Session, t domain.ForkTarget) (domain.MutationPlan, domain.Command, error) {

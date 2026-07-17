@@ -728,6 +728,54 @@ func TestDetectActiveIgnoresStaleRuntimeWithoutMatchedProcess(t *testing.T) {
 	}
 }
 
+func TestDetectActiveIgnoresProcessMatchedOnlyByCWD(t *testing.T) {
+	p := &Plugin{id: "claude", o: Options{RuntimeDir: t.TempDir(), Executable: "claude"}}
+	sessions := []domain.Session{{
+		PluginID:  "claude",
+		AgentType: "claude",
+		SessionID: "completed",
+		CWD:       "/work",
+		UpdatedAt: time.Unix(20, 0),
+		LastKind:  domain.EventTurnComplete,
+	}}
+
+	processes := []domain.Process{
+		{PID: 1, Executable: "phpstorm"},
+		{PID: 2, PPID: 1, Executable: "claude", CWD: "/work"},
+	}
+	ss, err := p.DetectActive(context.Background(), sessions, processes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ss[0].Status != "" {
+		t.Fatalf("process without direct session evidence should not mark a same-cwd session active: %#v", ss[0])
+	}
+}
+
+func TestDetectActiveFallsBackToCWDForTerminalProcess(t *testing.T) {
+	p := &Plugin{id: "claude", o: Options{RuntimeDir: t.TempDir(), Executable: "claude"}}
+	sessions := []domain.Session{{
+		PluginID:  "claude",
+		AgentType: "claude",
+		SessionID: "terminal-session",
+		CWD:       "/work",
+		UpdatedAt: time.Unix(20, 0),
+		LastKind:  domain.EventTurnComplete,
+	}}
+	processes := []domain.Process{
+		{PID: 1, Executable: "zsh"},
+		{PID: 2, PPID: 1, Executable: "claude", CWD: "/work"},
+	}
+
+	ss, err := p.DetectActive(context.Background(), sessions, processes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ss[0].Status != domain.StatusReady {
+		t.Fatalf("terminal-launched process should retain the cwd fallback: %#v", ss[0])
+	}
+}
+
 func TestDetectActiveRuntimeOverridesTailOnlyWhenMatched(t *testing.T) {
 	rt := t.TempDir()
 	sid := "sid-live"
@@ -797,9 +845,8 @@ func TestDetectActiveShellChildKeepsRunning(t *testing.T) {
 	}
 }
 
-// When several sessions run concurrently in the same cwd, cwd approximation alone only catches
-// the most recent one and misattributes the older ones. Verify that pid matching from the runtime
-// json correctly resolves both.
+// When several sessions run concurrently in the same cwd, verify that pid matching from the
+// runtime json resolves both without relying on the shared cwd.
 func TestDetectActivePIDMatchResolvesSameCWDCollision(t *testing.T) {
 	rt := t.TempDir()
 	older, newer := "sid-older", "sid-newer"
