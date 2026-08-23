@@ -897,3 +897,45 @@ func TestDetectActiveRuntimeUnknownStatusFallsBackToKind(t *testing.T) {
 		t.Fatalf("unknown runtime status should fall back to kind (turn_complete→ready), not drop: %#v", ss[0])
 	}
 }
+
+// Claude writes a content block only once it is complete, so the tail of a log names what has just
+// ended. LastKind must instead report what the session is doing now: a finished thinking block means
+// the model is already generating the next one, and a tool result means it is back to thinking.
+func TestScanLastKindIsOngoingActivity(t *testing.T) {
+	d := t.TempDir()
+	dir := filepath.Join(d, "proj")
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	prompt := `{"uuid":"u1","cwd":"/work","timestamp":"2026-06-23T00:00:00Z","message":{"role":"user","content":"question"}}`
+	thinking := `{"uuid":"a1","parentUuid":"u1","cwd":"/work","timestamp":"2026-06-23T00:00:01Z","message":{"role":"assistant","content":[{"type":"thinking","thinking":"pondering","signature":"sig"}]}}`
+	toolUse := `{"uuid":"a2","parentUuid":"a1","cwd":"/work","timestamp":"2026-06-23T00:00:02Z","message":{"role":"assistant","content":[{"type":"tool_use","name":"Read","input":{"file_path":"/work/x.go"}}]}}`
+	toolResult := `{"uuid":"u2","parentUuid":"a2","cwd":"/work","timestamp":"2026-06-23T00:00:03Z","message":{"role":"user","content":[{"type":"tool_result","content":"file body"}]}}`
+	files := map[string]struct {
+		lines []string
+		want  domain.EventKind
+	}{
+		"after-thinking.jsonl": {[]string{prompt, thinking}, domain.EventStream},
+		"after-result.jsonl":   {[]string{prompt, thinking, toolUse, toolResult}, domain.EventReasoning},
+		"after-tool-use.jsonl": {[]string{prompt, thinking, toolUse}, domain.EventToolCall},
+	}
+	for name, c := range files {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(strings.Join(c.lines, "\n")+"\n"), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	p := &Plugin{id: "claude", o: Options{ProjectsDir: d}}
+	res, err := p.Scan(context.Background(), plugin.ScanInput{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	seen := map[string]domain.EventKind{}
+	for _, s := range res.Sessions {
+		seen[filepath.Base(s.SourceRef.Source)] = s.LastKind
+	}
+	for name, c := range files {
+		if seen[name] != c.want {
+			t.Errorf("%s: LastKind = %q, want %q", name, seen[name], c.want)
+		}
+	}
+}

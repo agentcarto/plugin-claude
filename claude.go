@@ -59,7 +59,10 @@ func (Factory) Descriptor() plugin.Descriptor {
 	// size and the tokens generated — the only measurements the log offers. Advisor results gain the
 	// same ciphertext size (from encrypted_content) and drop their forwarded-context token count,
 	// which tracked the conversation's length rather than the call.
-	return plugin.Descriptor{Type: "claude", DisplayName: "Claude", ParserVersion: "11", Capabilities: domain.Capabilities{Scan: true, Conversation: true, Active: true, Resume: true, Rewind: true, Relocate: true}}
+	// ParserVersion=12: LastKind reports the activity in progress (common.Ongoing) rather than the
+	// kind of the last record. Claude writes a content block only once it is complete, so a thinking
+	// record means the thinking is over — the status display was labeling every phase one step behind.
+	return plugin.Descriptor{Type: "claude", DisplayName: "Claude", ParserVersion: "12", Capabilities: domain.Capabilities{Scan: true, Conversation: true, Active: true, Resume: true, Rewind: true, Relocate: true}}
 }
 
 func (Factory) New(id string, n *yaml.Node) (any, error) {
@@ -139,10 +142,9 @@ func (p *Plugin) scanSession(ctx context.Context, f string) (domain.Session, boo
 		return domain.Session{}, false
 	}
 	id := common.IDFromPath(f)
-	last := common.LastMeaningful(ev)
-	if last == domain.EventAssistant {
-		last = domain.EventStream
-	}
+	// A block is written only once it is finished, so the tail names what has just ended, not what
+	// the session is doing (common.Ongoing).
+	last := common.Ongoing(common.LastMeaningful(ev))
 	if cwd == "" {
 		cwd = "(unknown)"
 	}
@@ -178,7 +180,7 @@ func (p *Plugin) forkSession(ctx context.Context, path string) (domain.Session, 
 	// the parent's). `claude --resume <SessionID>` fails because no such session exists, and the
 	// fork branch has no resumable head either, so mark it unresumable (the app won't offer a
 	// resume action).
-	return domain.Session{PluginID: p.id, AgentType: "claude", SessionID: sid, CWD: cwd, StartedAt: start, UpdatedAt: updated, Title: title, SourceRef: domain.SessionRef{Source: path}, ParentSessionID: parent, ForkAt: forkAt, LastKind: common.LastMeaningful(ev), Unresumable: true}, true
+	return domain.Session{PluginID: p.id, AgentType: "claude", SessionID: sid, CWD: cwd, StartedAt: start, UpdatedAt: updated, Title: title, SourceRef: domain.SessionRef{Source: path}, ParentSessionID: parent, ForkAt: forkAt, LastKind: common.Ongoing(common.LastMeaningful(ev)), Unresumable: true}, true
 }
 
 // forkTitle derives the list title (and resolves the cwd) for a subagent fork. The title prefers
