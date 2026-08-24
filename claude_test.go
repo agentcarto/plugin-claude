@@ -845,6 +845,40 @@ func TestDetectActiveShellChildKeepsRunning(t *testing.T) {
 	}
 }
 
+// A waiting runtime is blocked on the user whatever the dialog is: the waitingFor label varies by
+// release ("permission prompt", "input needed" for an AskUserQuestion, …) and must not gate the flag.
+func TestDetectActiveWaitingRuntimeIsPermissionWait(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		rt   string
+		want bool
+	}{
+		{"permission prompt", `"status":"waiting","waitingFor":"permission prompt"`, true},
+		{"input needed", `"status":"waiting","waitingFor":"input needed"`, true},
+		{"unlabeled wait", `"status":"waiting"`, true},
+		{"busy", `"status":"busy"`, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rt := t.TempDir()
+			sid := "sid-wait"
+			if err := os.WriteFile(filepath.Join(rt, "4242.json"), []byte(`{"sessionId":"`+sid+`","pid":4242,`+tc.rt+`}`), 0600); err != nil {
+				t.Fatal(err)
+			}
+			p := &Plugin{id: "claude", o: Options{RuntimeDir: rt, Executable: "claude"}}
+			ss, err := p.DetectActive(context.Background(), []domain.Session{{PluginID: "claude", AgentType: "claude", SessionID: sid, LastKind: domain.EventToolCall}}, []domain.Process{{PID: 4242, Executable: "claude"}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if ss[0].Status != domain.StatusRunning {
+				t.Fatalf("waiting/busy runtime should be running: %#v", ss[0])
+			}
+			if ss[0].PermissionWait != tc.want {
+				t.Fatalf("permission wait=%v want %v: %#v", ss[0].PermissionWait, tc.want, ss[0])
+			}
+		})
+	}
+}
+
 // When several sessions run concurrently in the same cwd, verify that pid matching from the
 // runtime json resolves both without relying on the shared cwd.
 func TestDetectActivePIDMatchResolvesSameCWDCollision(t *testing.T) {

@@ -828,7 +828,12 @@ func (p *Plugin) DetectActive(_ context.Context, ss []domain.Session, ps []domai
 				// the session would drop out of the active list.
 				s.Status = common.ActiveStatus(s.LastKind, true)
 			}
-			s.PermissionWait = common.String(rt["status"]) == "waiting" && common.String(rt["waitingFor"]) == "permission prompt"
+			// "waiting" is Claude Code's own definition of "blocked on the user": it is reported
+			// exactly when a dialog or prompt is up. waitingFor is only the label for which one
+			// ("permission prompt", "input needed" for an AskUserQuestion/elicitation, "sandbox
+			// request", "dialog open", …) and comes from an internal table plus a fallback, so the
+			// label set changes between releases and must not be enumerated here.
+			s.PermissionWait = common.String(rt["status"]) == "waiting"
 			continue
 		}
 		if matched {
