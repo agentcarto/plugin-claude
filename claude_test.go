@@ -495,6 +495,147 @@ func TestParseEndTurnNotAddedToConversationNode(t *testing.T) {
 	}
 }
 
+func TestLoadConversationDropsDuplicateManualCompactLeaf(t *testing.T) {
+	d := t.TempDir()
+	src := filepath.Join(d, "s.jsonl")
+	data := []byte(
+		`{"uuid":"u1","parentUuid":null,"timestamp":"2026-08-25T00:00:00Z","type":"user","message":{"role":"user","content":"before compact"}}` + "\n" +
+			`{"uuid":"a1","parentUuid":"u1","timestamp":"2026-08-25T00:00:01Z","type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"before answer"}]}}` + "\n" +
+			`{"uuid":"bare","parentUuid":"a1","timestamp":"2026-08-25T00:00:02Z","type":"user","message":{"role":"user","content":"/compact"}}` + "\n" +
+			`{"uuid":"boundary","parentUuid":null,"logicalParentUuid":"a1","timestamp":"2026-08-25T00:00:03Z","type":"system","subtype":"compact_boundary","compactMetadata":{"trigger":"manual"}}` + "\n" +
+			`{"uuid":"summary","parentUuid":"boundary","timestamp":"2026-08-25T00:00:04Z","type":"user","isCompactSummary":true,"message":{"role":"user","content":"summary body"}}` + "\n" +
+			`{"uuid":"meta","parentUuid":"summary","timestamp":"2026-08-25T00:00:05Z","type":"user","isMeta":true,"message":{"role":"user","content":"command caveat"}}` + "\n" +
+			`{"uuid":"xml","parentUuid":"meta","timestamp":"2026-08-25T00:00:06Z","type":"user","message":{"role":"user","content":"<command-name>/compact</command-name>"}}` + "\n" +
+			`{"uuid":"u2","parentUuid":"xml","timestamp":"2026-08-25T00:00:07Z","type":"user","message":{"role":"user","content":"after compact"}}` + "\n" +
+			`{"uuid":"a2","parentUuid":"u2","timestamp":"2026-08-25T00:00:08Z","type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"after answer"}]}}` + "\n")
+	if err := os.WriteFile(src, data, 0600); err != nil {
+		t.Fatal(err)
+	}
+	p := &Plugin{}
+	c, err := p.LoadConversation(context.Background(), domain.SessionRef{Source: src})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := c.Nodes["bare"]; ok {
+		t.Fatal("duplicate bare /compact leaf should not be a conversation node")
+	}
+	if got := c.Children["a1"]; len(got) != 1 || got[0] != "boundary" {
+		t.Fatalf("compact parent children = %v, want only boundary", got)
+	}
+	wantPath := []string{"u1", "a1", "boundary", "summary", "meta", "xml", "u2", "a2"}
+	if got := c.ActivePath(); strings.Join(got, ",") != strings.Join(wantPath, ",") {
+		t.Fatalf("active path = %v, want %v", got, wantPath)
+	}
+	if got := c.Nodes["summary"].Events; len(got) != 1 || got[0].RawType != domain.RawCompactSummary {
+		t.Fatalf("compact summary event = %#v", got)
+	}
+	if got := c.Nodes["xml"].Events; len(got) != 1 || got[0].Command != "/compact" {
+		t.Fatalf("XML compact command = %#v", got)
+	}
+}
+
+func TestDropDuplicateManualCompactLeavesKeepsNonMatches(t *testing.T) {
+	bare := func(id, parent, text string) domain.ConvNode {
+		return domain.ConvNode{ID: id, Parent: parent, Events: []domain.Event{{Kind: domain.EventUser, Text: text}}}
+	}
+	child := domain.ConvNode{ID: "child", Parent: "candidate", Events: []domain.Event{{Kind: domain.EventAssistant, Text: "reply"}}}
+	withExtraContent := bare("candidate", "parent", "/compact")
+	withExtraContent.Events = append(withExtraContent.Events, domain.Event{Kind: domain.EventAssistant, Text: "keep me"})
+	tests := []struct {
+		name       string
+		nodes      []domain.ConvNode
+		ordinals   map[string]int
+		boundaries []compactBoundary
+	}{
+		{
+			name:       "compact mention",
+			nodes:      []domain.ConvNode{bare("candidate", "parent", "please run /compact")},
+			ordinals:   map[string]int{"candidate": 1},
+			boundaries: []compactBoundary{{parent: "parent", ordinal: 2}},
+		},
+		{
+			name:       "compact with arguments",
+			nodes:      []domain.ConvNode{bare("candidate", "parent", "/compact keep these notes")},
+			ordinals:   map[string]int{"candidate": 1},
+			boundaries: []compactBoundary{{parent: "parent", ordinal: 2}},
+		},
+		{
+			name:       "candidate has child",
+			nodes:      []domain.ConvNode{bare("candidate", "parent", "/compact"), child},
+			ordinals:   map[string]int{"candidate": 1, "child": 2},
+			boundaries: []compactBoundary{{parent: "parent", ordinal: 3}},
+		},
+		{
+			name:       "candidate has other content",
+			nodes:      []domain.ConvNode{withExtraContent},
+			ordinals:   map[string]int{"candidate": 1},
+			boundaries: []compactBoundary{{parent: "parent", ordinal: 2}},
+		},
+		{
+			name:       "different parent",
+			nodes:      []domain.ConvNode{bare("candidate", "other-parent", "/compact")},
+			ordinals:   map[string]int{"candidate": 1},
+			boundaries: []compactBoundary{{parent: "parent", ordinal: 2}},
+		},
+		{
+			name:     "no boundary",
+			nodes:    []domain.ConvNode{bare("candidate", "parent", "/compact")},
+			ordinals: map[string]int{"candidate": 1},
+		},
+		{
+			name:       "candidate follows boundary",
+			nodes:      []domain.ConvNode{bare("candidate", "parent", "/compact")},
+			ordinals:   map[string]int{"candidate": 3},
+			boundaries: []compactBoundary{{parent: "parent", ordinal: 2}},
+		},
+		{
+			name:       "multiple candidates",
+			nodes:      []domain.ConvNode{bare("candidate", "parent", "/compact"), bare("other", "parent", "/compact")},
+			ordinals:   map[string]int{"candidate": 1, "other": 2},
+			boundaries: []compactBoundary{{parent: "parent", ordinal: 3}},
+		},
+		{
+			name:       "candidate matches multiple boundaries",
+			nodes:      []domain.ConvNode{bare("candidate", "parent", "/compact")},
+			ordinals:   map[string]int{"candidate": 1},
+			boundaries: []compactBoundary{{parent: "parent", ordinal: 2}, {parent: "parent", ordinal: 3}},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := dropDuplicateManualCompactLeaves(tt.nodes, tt.ordinals, tt.boundaries)
+			found := false
+			for _, n := range got {
+				if n.ID == "candidate" {
+					found = true
+				}
+			}
+			if !found {
+				t.Fatalf("candidate was removed from %#v", got)
+			}
+		})
+	}
+}
+
+func TestParseKeepsBareCompactBesideAutomaticBoundary(t *testing.T) {
+	d := t.TempDir()
+	src := filepath.Join(d, "s.jsonl")
+	data := []byte(
+		`{"uuid":"parent","timestamp":"2026-08-25T00:00:00Z","type":"assistant","message":{"role":"assistant","content":"answer"}}` + "\n" +
+			`{"uuid":"candidate","parentUuid":"parent","timestamp":"2026-08-25T00:00:01Z","type":"user","message":{"role":"user","content":"/compact"}}` + "\n" +
+			`{"uuid":"boundary","parentUuid":null,"logicalParentUuid":"parent","timestamp":"2026-08-25T00:00:02Z","type":"system","subtype":"compact_boundary","compactMetadata":{"trigger":"auto"}}` + "\n")
+	if err := os.WriteFile(src, data, 0600); err != nil {
+		t.Fatal(err)
+	}
+	_, nodes, _, _, _, _, _, _ := parse(context.Background(), src)
+	for _, n := range nodes {
+		if n.ID == "candidate" {
+			return
+		}
+	}
+	t.Fatalf("automatic compact changed non-matching nodes: %#v", nodes)
+}
+
 func TestLoadConversationWithoutUUIDFallsBackToLinear(t *testing.T) {
 	d := t.TempDir()
 	src := filepath.Join(d, "s.jsonl")

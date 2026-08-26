@@ -62,7 +62,9 @@ func (Factory) Descriptor() plugin.Descriptor {
 	// ParserVersion=12: LastKind reports the activity in progress (common.Ongoing) rather than the
 	// kind of the last record. Claude writes a content block only once it is complete, so a thinking
 	// record means the thinking is over — the status display was labeling every phase one step behind.
-	return plugin.Descriptor{Type: "claude", DisplayName: "Claude", ParserVersion: "12", Capabilities: domain.Capabilities{Scan: true, Conversation: true, Active: true, Resume: true, Rewind: true, Relocate: true}}
+	// ParserVersion=13: a manual compact's superseded bare /compact leaf is removed when it maps
+	// uniquely to the compact_boundary, so it no longer appears as an empty rewind branch.
+	return plugin.Descriptor{Type: "claude", DisplayName: "Claude", ParserVersion: "13", Capabilities: domain.Capabilities{Scan: true, Conversation: true, Active: true, Resume: true, Rewind: true, Relocate: true}}
 }
 
 func (Factory) New(id string, n *yaml.Node) (any, error) {
@@ -490,8 +492,70 @@ func emptyCommandOutput(content string) bool {
 	return emptyCommandOutputRE.MatchString(content)
 }
 
+type compactBoundary struct {
+	parent  string
+	ordinal int
+}
+
+// dropDuplicateManualCompactLeaves removes Claude's first representation of a manual /compact:
+// a bare user-command leaf beside the compact_boundary that supersedes it. Keep every candidate
+// unless the transcript gives exactly one unambiguous correspondence, since ordinary user text
+// and incomplete/corrupt transcripts must remain visible in the graph.
+func dropDuplicateManualCompactLeaves(nodes []domain.ConvNode, ordinals map[string]int, boundaries []compactBoundary) []domain.ConvNode {
+	children := make(map[string]int, len(nodes))
+	for _, n := range nodes {
+		if n.Parent != "" {
+			children[n.Parent]++
+		}
+	}
+
+	matches := map[string]int{}
+	ambiguous := map[string]bool{}
+	for _, boundary := range boundaries {
+		if boundary.parent == "" {
+			continue
+		}
+		var candidates []string
+		for _, n := range nodes {
+			ordinal, ok := ordinals[n.ID]
+			if !ok || ordinal >= boundary.ordinal || n.Parent != boundary.parent || children[n.ID] != 0 || !isBareCompactOnlyNode(n) {
+				continue
+			}
+			candidates = append(candidates, n.ID)
+		}
+		switch len(candidates) {
+		case 1:
+			matches[candidates[0]]++
+		case 0:
+		default:
+			for _, id := range candidates {
+				ambiguous[id] = true
+			}
+		}
+	}
+
+	out := make([]domain.ConvNode, 0, len(nodes))
+	for _, n := range nodes {
+		if matches[n.ID] == 1 && !ambiguous[n.ID] {
+			continue
+		}
+		out = append(out, n)
+	}
+	return out
+}
+
+func isBareCompactOnlyNode(n domain.ConvNode) bool {
+	if len(n.Events) != 1 {
+		return false
+	}
+	e := n.Events[0]
+	return e.Kind == domain.EventUser && strings.TrimSpace(e.Text) == "/compact" && e.Prompt == "" && e.Command == "" && e.RawType != domain.RawCompactSummary
+}
+
 func parse(ctx context.Context, path string) (ev []domain.Event, nodes []domain.ConvNode, queued []domain.Event, cwd string, start time.Time, model, parentSID, parentLast string) {
-	_ = common.JSONLines(ctx, path, func(_ int, o map[string]any) error {
+	ordinals := map[string]int{}
+	var compactBoundaries []compactBoundary
+	_ = common.JSONLines(ctx, path, func(ordinal int, o map[string]any) error {
 		ts := common.Time(common.String(o["timestamp"]))
 		if start.IsZero() && !ts.IsZero() {
 			start = ts
@@ -560,10 +624,16 @@ func parse(ctx context.Context, path string) (ev []domain.Event, nodes []domain.
 			if parent == "" {
 				parent = common.String(o["logicalParentUuid"])
 			}
+			ordinals[id] = ordinal
+			metadata := common.Map(o["compactMetadata"])
+			if common.String(o["type"]) == "system" && common.String(o["subtype"]) == "compact_boundary" && common.String(metadata["trigger"]) == "manual" {
+				compactBoundaries = append(compactBoundaries, compactBoundary{parent: parent, ordinal: ordinal})
+			}
 			nodes = append(nodes, domain.ConvNode{ID: id, Parent: parent, Timestamp: ts, Events: es})
 		}
 		return nil
 	})
+	nodes = dropDuplicateManualCompactLeaves(nodes, ordinals, compactBoundaries)
 	return ev, nodes, queued, cwd, start, model, parentSID, parentLast
 }
 
