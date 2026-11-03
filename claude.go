@@ -64,7 +64,11 @@ func (Factory) Descriptor() plugin.Descriptor {
 	// record means the thinking is over — the status display was labeling every phase one step behind.
 	// ParserVersion=13: a manual compact's superseded bare /compact leaf is removed when it maps
 	// uniquely to the compact_boundary, so it no longer appears as an empty rewind branch.
-	return plugin.Descriptor{Type: "claude", DisplayName: "Claude", ParserVersion: "13", Capabilities: domain.Capabilities{Scan: true, Conversation: true, Active: true, Resume: true, Rewind: true, Relocate: true}}
+	// ParserVersion=14: an away_summary and an idle compaction (its summary and re-attached files)
+	// carry Event.BetweenTurns, so the host leaves them out of the time of the turn they are filed
+	// under, and LastKind passes over them: one at the tail read as an answer being written, so a
+	// finished session without a runtime file stayed RUN.
+	return plugin.Descriptor{Type: "claude", DisplayName: "Claude", ParserVersion: "14", Capabilities: domain.Capabilities{Scan: true, Conversation: true, Active: true, Resume: true, Rewind: true, Relocate: true}}
 }
 
 func (Factory) New(id string, n *yaml.Node) (any, error) {
@@ -144,9 +148,7 @@ func (p *Plugin) scanSession(ctx context.Context, f string) (domain.Session, boo
 		return domain.Session{}, false
 	}
 	id := common.IDFromPath(f)
-	// A block is written only once it is finished, so the tail names what has just ended, not what
-	// the session is doing (common.Ongoing).
-	last := common.Ongoing(common.LastMeaningful(ev))
+	last := lastActivity(ev)
 	if cwd == "" {
 		cwd = "(unknown)"
 	}
@@ -182,7 +184,25 @@ func (p *Plugin) forkSession(ctx context.Context, path string) (domain.Session, 
 	// the parent's). `claude --resume <SessionID>` fails because no such session exists, and the
 	// fork branch has no resumable head either, so mark it unresumable (the app won't offer a
 	// resume action).
-	return domain.Session{PluginID: p.id, AgentType: "claude", SessionID: sid, CWD: cwd, StartedAt: start, UpdatedAt: updated, Title: title, SourceRef: domain.SessionRef{Source: path}, ParentSessionID: parent, ForkAt: forkAt, LastKind: common.Ongoing(common.LastMeaningful(ev)), Unresumable: true}, true
+	return domain.Session{PluginID: p.id, AgentType: "claude", SessionID: sid, CWD: cwd, StartedAt: start, UpdatedAt: updated, Title: title, SourceRef: domain.SessionRef{Source: path}, ParentSessionID: parent, ForkAt: forkAt, LastKind: lastActivity(ev), Unresumable: true}, true
+}
+
+// lastActivity is the activity a session is in, judged from the tail of its events (see
+// domain.Session.LastKind). A block is written only once it is finished, so the tail names what
+// has just ended and common.Ongoing maps it to what follows. Events written between turns (a recap,
+// an idle compaction) are passed over: they are not something the model is doing, and at the tail
+// they would read as an answer still being written or a prompt being thought about.
+func lastActivity(ev []domain.Event) domain.EventKind {
+	for i := len(ev) - 1; i >= 0; i-- {
+		if ev[i].BetweenTurns {
+			continue
+		}
+		// One event at a time, so which kinds count as an activity stays core's rule.
+		if k := common.LastMeaningful(ev[i : i+1]); k != "" {
+			return common.Ongoing(k)
+		}
+	}
+	return ""
 }
 
 // forkTitle derives the list title (and resolves the cwd) for a subagent fork. The title prefers
@@ -451,7 +471,7 @@ func systemEvents(o map[string]any, ts time.Time) []domain.Event {
 	}
 	switch common.String(o["subtype"]) {
 	case "away_summary":
-		return []domain.Event{{Kind: domain.EventAssistant, Text: content, Timestamp: ts, RawType: "away_summary"}}
+		return []domain.Event{{Kind: domain.EventAssistant, Text: content, Timestamp: ts, RawType: "away_summary", BetweenTurns: true}}
 	case "local_command":
 		if emptyCommandOutput(content) {
 			return nil
@@ -555,6 +575,7 @@ func isBareCompactOnlyNode(n domain.ConvNode) bool {
 func parse(ctx context.Context, path string) (ev []domain.Event, nodes []domain.ConvNode, queued []domain.Event, cwd string, start time.Time, model, parentSID, parentLast string) {
 	ordinals := map[string]int{}
 	var compactBoundaries []compactBoundary
+	idleCompact := false
 	_ = common.JSONLines(ctx, path, func(ordinal int, o map[string]any) error {
 		ts := common.Time(common.String(o["timestamp"]))
 		if start.IsZero() && !ts.IsZero() {
@@ -597,10 +618,26 @@ func parse(ctx context.Context, path string) (ev []domain.Event, nodes []domain.
 			}
 		}
 		// The /compact auto-summary node is marked so the heading can render it as a boundary.
-		if b, ok := o["isCompactSummary"].(bool); ok && b {
+		compactSummary, _ := o["isCompactSummary"].(bool)
+		if compactSummary {
 			for i := range es {
 				es[i].RawType = domain.RawCompactSummary
 			}
+		}
+		// An automatic compaction with no turn running is Claude Code compacting an idle session
+		// (before the prompt cache expires), not work of the turn it gets filed under. The log has no
+		// field that says "idle" — only a notice whose wording is UI text — so it is told apart by
+		// what came before it: a finished turn. Its summary and the files it re-attaches are marked
+		// until the next user or assistant record, whether or not that record has anything to show.
+		switch typ := common.String(o["type"]); {
+		case typ == "system" && common.String(o["subtype"]) == "compact_boundary":
+			idleCompact = common.String(common.Map(o["compactMetadata"])["trigger"]) == "auto" && lastActivity(ev) == domain.EventTurnComplete
+		case idleCompact && (compactSummary || typ == "attachment"):
+			for i := range es {
+				es[i].BetweenTurns = true
+			}
+		case typ == "user" || typ == "assistant" || len(es) > 0:
+			idleCompact = false
 		}
 		// Stamp each event from an assistant record with the model that produced
 		// it, so the host can show per-turn models. Session.Model still takes the

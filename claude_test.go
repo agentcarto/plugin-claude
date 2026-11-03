@@ -407,7 +407,8 @@ func TestParseAdvisorToolResultError(t *testing.T) {
 }
 
 // away_summary system records carry the recap of what the agent did while the
-// user was away; they surface as assistant text like Claude Code shows them.
+// user was away; they surface as assistant text like Claude Code shows them,
+// marked as written between turns so the host does not count them in the turn's time.
 func TestParseSystemAwaySummary(t *testing.T) {
 	d := t.TempDir()
 	src := filepath.Join(d, "s.jsonl")
@@ -416,11 +417,68 @@ func TestParseSystemAwaySummary(t *testing.T) {
 		t.Fatal(err)
 	}
 	ev, nodes, _, _, _, _, _, _ := parse(context.Background(), src)
-	if len(ev) != 1 || ev[0].Kind != domain.EventAssistant || ev[0].Text != "built the slides and verified the output" {
+	if len(ev) != 1 || ev[0].Kind != domain.EventAssistant || ev[0].Text != "built the slides and verified the output" || !ev[0].BetweenTurns {
 		t.Fatalf("events=%#v", ev)
 	}
-	if len(nodes) != 1 || len(nodes[0].Events) != 1 {
+	if len(nodes) != 1 || len(nodes[0].Events) != 1 || !nodes[0].Events[0].BetweenTurns {
 		t.Fatalf("nodes=%#v", nodes)
+	}
+}
+
+// Claude Code compacts an idle session on its own before the prompt cache expires. That compaction
+// is not work of the turn it is filed under: its summary and the files it re-attaches are marked as
+// written between turns, up to the next user or assistant record. A compaction the user waited
+// for — a manual /compact, or an automatic one in the middle of a turn — is not marked. The idle
+// case follows the order real logs write: a finished turn, often an away_summary, the boundary,
+// the summary, re-attached files, a notice, and later the next prompt with its own @-file.
+func TestParseMarksOnlyIdleCompactionAsBetweenTurns(t *testing.T) {
+	const (
+		prompt  = `{"uuid":"u1","type":"user","timestamp":"2026-11-03T09:43:00Z","message":{"role":"user","content":"question"}}`
+		answer  = `{"uuid":"a1","parentUuid":"u1","type":"assistant","timestamp":"2026-11-03T09:45:00Z","message":{"role":"assistant","stop_reason":"end_turn","content":[{"type":"text","text":"done"}]}}`
+		toolUse = `{"uuid":"a1","parentUuid":"u1","type":"assistant","timestamp":"2026-11-03T09:45:00Z","message":{"role":"assistant","stop_reason":"tool_use","content":[{"type":"tool_use","name":"Read","input":{"file_path":"/w/x.go"}}]}}`
+		away    = `{"uuid":"w1","parentUuid":"a1","type":"system","subtype":"away_summary","timestamp":"2026-11-03T10:13:00Z","content":"answered the question","isMeta":false}`
+		summary = `{"uuid":"s1","parentUuid":"b1","type":"user","timestamp":"2026-11-03T10:40:19Z","isCompactSummary":true,"message":{"role":"user","content":"This session is being continued from a previous conversation."}}`
+		reread  = `{"uuid":"f1","parentUuid":"s1","type":"attachment","timestamp":"2026-11-03T10:40:20Z","attachment":{"type":"file","filename":"/w/notes.md","content":{"type":"text","file":{"filePath":"/w/notes.md","content":"notes"}}}}`
+		notice  = `{"uuid":"i1","parentUuid":"f1","type":"system","subtype":"informational","timestamp":"2026-11-03T10:40:20Z","content":"Compacted while idle","isMeta":false}`
+		next    = `{"uuid":"u2","parentUuid":"i1","type":"user","timestamp":"2026-11-03T11:26:29Z","message":{"role":"user","content":"look at @other.md"}}`
+		mention = `{"uuid":"f2","parentUuid":"u2","type":"attachment","timestamp":"2026-11-03T11:26:29Z","attachment":{"type":"file","filename":"/w/other.md","content":{"type":"text","file":{"filePath":"/w/other.md","content":"other"}}}}`
+		// A user record with nothing to show (an injected reminder) still ends the compaction.
+		reminder = `{"uuid":"m1","parentUuid":"i1","type":"user","isMeta":true,"timestamp":"2026-11-03T11:26:29Z","message":{"role":"user","content":"<system-reminder>x</system-reminder>"}}`
+	)
+	boundary := func(trigger string) string {
+		return `{"uuid":"b1","parentUuid":null,"logicalParentUuid":"a1","timestamp":"2026-11-03T10:40:19Z","type":"system","subtype":"compact_boundary","compactMetadata":{"trigger":"` + trigger + `"}}`
+	}
+	marked := func(t *testing.T, lines ...string) map[string]bool {
+		t.Helper()
+		src := filepath.Join(t.TempDir(), "s.jsonl")
+		if err := os.WriteFile(src, []byte(strings.Join(lines, "\n")+"\n"), 0600); err != nil {
+			t.Fatal(err)
+		}
+		_, nodes, _, _, _, _, _, _ := parse(context.Background(), src)
+		out := map[string]bool{}
+		for _, n := range nodes {
+			for _, e := range n.Events {
+				out[n.ID] = out[n.ID] || e.BetweenTurns
+			}
+		}
+		return out
+	}
+
+	idle := marked(t, prompt, answer, away, boundary("auto"), summary, reread, notice, next, mention)
+	if !idle["s1"] || !idle["f1"] || !idle["w1"] {
+		t.Fatalf("an idle compaction's summary and re-attached file, and the away_summary, should be marked: %v", idle)
+	}
+	if idle["u1"] || idle["a1"] || idle["u2"] || idle["f2"] {
+		t.Fatalf("only what was written between turns should be marked: %v", idle)
+	}
+	if quiet := marked(t, prompt, answer, boundary("auto"), summary, notice, reminder, mention); quiet["f2"] {
+		t.Fatalf("a user record ends the compaction even with nothing to show: %v", quiet)
+	}
+	if manual := marked(t, prompt, answer, boundary("manual"), summary, reread); manual["s1"] || manual["f1"] {
+		t.Fatalf("a manual /compact is not between turns: %v", manual)
+	}
+	if midTurn := marked(t, prompt, toolUse, boundary("auto"), summary, reread); midTurn["s1"] || midTurn["f1"] {
+		t.Fatalf("an automatic compaction in the middle of a turn is not between turns: %v", midTurn)
 	}
 }
 
@@ -1169,6 +1227,10 @@ func TestScanLastKindIsOngoingActivity(t *testing.T) {
 	thinking := `{"uuid":"a1","parentUuid":"u1","cwd":"/work","timestamp":"2026-06-23T00:00:01Z","message":{"role":"assistant","content":[{"type":"thinking","thinking":"pondering","signature":"sig"}]}}`
 	toolUse := `{"uuid":"a2","parentUuid":"a1","cwd":"/work","timestamp":"2026-06-23T00:00:02Z","message":{"role":"assistant","content":[{"type":"tool_use","name":"Read","input":{"file_path":"/work/x.go"}}]}}`
 	toolResult := `{"uuid":"u2","parentUuid":"a2","cwd":"/work","timestamp":"2026-06-23T00:00:03Z","message":{"role":"user","content":[{"type":"tool_result","content":"file body"}]}}`
+	answer := `{"uuid":"a3","parentUuid":"u2","cwd":"/work","timestamp":"2026-06-23T00:00:04Z","message":{"role":"assistant","stop_reason":"end_turn","content":[{"type":"text","text":"done"}]}}`
+	away := func(parent string) string {
+		return `{"uuid":"s1","parentUuid":"` + parent + `","cwd":"/work","timestamp":"2026-06-23T00:00:05Z","type":"system","subtype":"away_summary","content":"answered the question","isMeta":false}`
+	}
 	files := map[string]struct {
 		lines []string
 		want  domain.EventKind
@@ -1176,6 +1238,14 @@ func TestScanLastKindIsOngoingActivity(t *testing.T) {
 		"after-thinking.jsonl": {[]string{prompt, thinking}, domain.EventStream},
 		"after-result.jsonl":   {[]string{prompt, thinking, toolUse, toolResult}, domain.EventReasoning},
 		"after-tool-use.jsonl": {[]string{prompt, thinking, toolUse}, domain.EventToolCall},
+		// A recap of the session is not an activity: the turn it follows decides.
+		"away-after-answer.jsonl":    {[]string{prompt, thinking, toolUse, toolResult, answer, away("a3")}, domain.EventTurnComplete},
+		"away-during-tool-use.jsonl": {[]string{prompt, thinking, toolUse, away("a2")}, domain.EventToolCall},
+		// Nor is a compaction done while the session sat idle: its summary is not a prompt being answered.
+		"idle-compaction.jsonl": {[]string{prompt, thinking, toolUse, toolResult, answer,
+			`{"uuid":"b1","parentUuid":null,"logicalParentUuid":"a3","cwd":"/work","timestamp":"2026-06-23T00:55:00Z","type":"system","subtype":"compact_boundary","compactMetadata":{"trigger":"auto"}}`,
+			`{"uuid":"s1","parentUuid":"b1","cwd":"/work","timestamp":"2026-06-23T00:55:00Z","isCompactSummary":true,"message":{"role":"user","content":"This session is being continued from a previous conversation."}}`,
+		}, domain.EventTurnComplete},
 	}
 	for name, c := range files {
 		if err := os.WriteFile(filepath.Join(dir, name), []byte(strings.Join(c.lines, "\n")+"\n"), 0600); err != nil {
