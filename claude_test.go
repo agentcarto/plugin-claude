@@ -951,9 +951,10 @@ func TestDetectActiveMatchesByRuntimePID(t *testing.T) {
 	}
 }
 
-// A background shell (run_in_background) outlives the agent turn: the runtime status reports idle
-// while a shell child of the claude pid is still running. The session must not be shown as ready.
-func TestDetectActiveShellChildKeepsRunning(t *testing.T) {
+// A background shell (run_in_background) outlives the agent turn: older releases report the runtime
+// status idle while a shell child of the claude pid is still running. The session must be shown as
+// a finished turn with a shell still working, neither ready nor running.
+func TestDetectActiveIdleWithShellChildIsShell(t *testing.T) {
 	rt := t.TempDir()
 	sid := "sid-shell"
 	if err := os.WriteFile(filepath.Join(rt, "4242.json"), []byte(`{"sessionId":"`+sid+`","pid":4242,"status":"idle"}`), 0600); err != nil {
@@ -971,18 +972,67 @@ func TestDetectActiveShellChildKeepsRunning(t *testing.T) {
 		t.Fatalf("no shell child should be ready: %#v", ready[0])
 	}
 
-	// A live shell child of the claude pid keeps it running; a non-shell child (e.g. MCP server) does not.
-	ps := []domain.Process{
+	// A non-shell child (e.g. an MCP server) is not a shell at work.
+	mcpOnly, err := p.DetectActive(context.Background(), append([]domain.Session(nil), sess...), []domain.Process{
 		{PID: 4242, Executable: "claude"},
 		{PID: 5000, PPID: 4242, Executable: "npm"},
-		{PID: 5001, PPID: 4242, Executable: "zsh"},
-	}
-	run, err := p.DetectActive(context.Background(), append([]domain.Session(nil), sess...), ps)
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if run[0].Status != domain.StatusRunning {
-		t.Fatalf("live shell child should keep running: %#v", run[0])
+	if mcpOnly[0].Status != domain.StatusReady {
+		t.Fatalf("a non-shell child should leave it ready: %#v", mcpOnly[0])
+	}
+
+	shell, err := p.DetectActive(context.Background(), append([]domain.Session(nil), sess...), []domain.Process{
+		{PID: 4242, Executable: "claude"},
+		{PID: 5000, PPID: 4242, Executable: "npm"},
+		{PID: 5001, PPID: 4242, Executable: "zsh"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if shell[0].Status != domain.StatusShell {
+		t.Fatalf("idle with a live shell child should be shell: %#v", shell[0])
+	}
+}
+
+// Newer releases name the same state themselves: the runtime status "shell" means the turn is over
+// while a background Bash task is unfinished.
+func TestDetectActiveShellRuntimeIsShell(t *testing.T) {
+	rt := t.TempDir()
+	sid := "sid-shell-runtime"
+	if err := os.WriteFile(filepath.Join(rt, "4242.json"), []byte(`{"sessionId":"`+sid+`","pid":4242,"status":"shell"}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	p := &Plugin{id: "claude", o: Options{RuntimeDir: rt, Executable: "claude"}}
+	// The tail says the model is writing, which the runtime status must override.
+	ss, err := p.DetectActive(context.Background(), []domain.Session{{PluginID: "claude", AgentType: "claude", SessionID: sid, LastKind: domain.EventStream}}, []domain.Process{{PID: 4242, Executable: "claude"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ss[0].Status != domain.StatusShell || ss[0].PermissionWait {
+		t.Fatalf("shell runtime should be shell without an ask: %#v", ss[0])
+	}
+}
+
+// A shell child during a turn is the Bash tool at work in that turn, so the session stays running.
+func TestDetectActiveBusyWithShellChildStaysRunning(t *testing.T) {
+	rt := t.TempDir()
+	sid := "sid-busy-shell"
+	if err := os.WriteFile(filepath.Join(rt, "4242.json"), []byte(`{"sessionId":"`+sid+`","pid":4242,"status":"busy"}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	p := &Plugin{id: "claude", o: Options{RuntimeDir: rt, Executable: "claude"}}
+	ss, err := p.DetectActive(context.Background(), []domain.Session{{PluginID: "claude", AgentType: "claude", SessionID: sid, LastKind: domain.EventToolCall}}, []domain.Process{
+		{PID: 4242, Executable: "claude"},
+		{PID: 5001, PPID: 4242, Executable: "zsh"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ss[0].Status != domain.StatusRunning {
+		t.Fatalf("busy with a shell child should stay running: %#v", ss[0])
 	}
 }
 
@@ -1054,7 +1104,7 @@ func TestDetectActivePIDMatchResolvesSameCWDCollision(t *testing.T) {
 	}
 }
 
-// When the runtime status is an unknown value (anything other than idle/busy/waiting), it falls
+// When the runtime status is an unknown value (anything other than busy/shell/idle/waiting), it falls
 // back to the last event kind. Without the fallback the Status would be left empty and the session
 // would drop out of the active list.
 func TestDetectActiveRuntimeUnknownStatusFallsBackToKind(t *testing.T) {

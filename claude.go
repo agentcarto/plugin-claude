@@ -822,6 +822,8 @@ func (p *Plugin) ResumeCommand(s domain.Session) (domain.Command, error) {
 	return domain.Command{Executable: p.o.Executable, Args: []string{"--resume", s.SessionID}, WorkingDirectory: s.CWD}, nil
 }
 
+// DetectActive sets Status (and PermissionWait) on the sessions a live claude process is working
+// on, from Claude Code's runtime files under RuntimeDir and the process list.
 func (p *Plugin) DetectActive(_ context.Context, ss []domain.Session, ps []domain.Process) ([]domain.Session, error) {
 	runtimeBy := map[string]map[string]any{}
 	pidToSession := map[int32]string{}
@@ -850,9 +852,10 @@ func (p *Plugin) DetectActive(_ context.Context, ss []domain.Session, ps []domai
 		}
 	}
 	// shell detection: Claude Code runs its Bash tool by spawning a shell as a direct child of the
-	// claude process. A background shell (run_in_background) outlives the turn, so the runtime
-	// status flips to "idle" (and would map to Ready) while the shell is still working. Mark any
-	// session whose claude pid has a live shell child so it is not downgraded to Ready below.
+	// claude process. A background shell (run_in_background) outlives the turn. Newer releases
+	// report that state themselves as the runtime status "shell", but older ones flip to "idle"
+	// while the shell is still working, so a live shell child is the only clue there. Mark any
+	// session whose claude pid has one so it is not presented as Ready below.
 	shellRunning := map[string]bool{}
 	for _, pr := range ps {
 		if sid, ok := pidToSession[pr.PPID]; ok && isShellProcess(pr) {
@@ -890,12 +893,15 @@ func (p *Plugin) DetectActive(_ context.Context, ss []domain.Session, ps []domai
 			switch common.String(rt["status"]) {
 			case "busy", "waiting":
 				s.Status = domain.StatusRunning
+			case "shell":
+				// Claude Code's own name for "idle, with a background Bash task not yet finished".
+				s.Status = domain.StatusShell
 			case "idle":
 				s.Status = domain.StatusReady
 			default:
-				// For an unknown runtime status (anything other than idle/busy/waiting), fall back
-				// to the last event kind. Without this fallback the status would be left empty and
-				// the session would drop out of the active list.
+				// For an unknown runtime status (anything other than busy/shell/idle/waiting), fall
+				// back to the last event kind. Without this fallback the status would be left empty
+				// and the session would drop out of the active list.
 				s.Status = common.ActiveStatus(s.LastKind, true)
 			}
 			// "waiting" is Claude Code's own definition of "blocked on the user": it is reported
@@ -910,11 +916,11 @@ func (p *Plugin) DetectActive(_ context.Context, ss []domain.Session, ps []domai
 			s.Status = common.ActiveStatus(s.LastKind, true)
 		}
 	}
-	// A session with a live shell child is still working even if the runtime/last-event status
-	// says it is done; never present it as Ready.
+	// A finished turn with a live shell child still has work going on, so it is not Ready. It is
+	// not Running either: Running would present the finished turn as still in progress.
 	for i := range ss {
 		if ss[i].Status == domain.StatusReady && shellRunning[ss[i].SessionID] {
-			ss[i].Status = domain.StatusRunning
+			ss[i].Status = domain.StatusShell
 		}
 	}
 	return ss, nil
