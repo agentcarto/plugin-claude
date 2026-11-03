@@ -951,6 +951,39 @@ func TestDetectActiveMatchesByRuntimePID(t *testing.T) {
 	}
 }
 
+// After a /clear the process keeps the arguments it was started with, so `claude --resume <old>` still
+// names the old session while the runtime json maps the pid to the new one. Only the new one is active.
+func TestDetectActiveRuntimePIDOverridesStaleResumeArgs(t *testing.T) {
+	rt := t.TempDir()
+	if err := os.WriteFile(filepath.Join(rt, "4242.json"), []byte(`{"sessionId":"sid-new","pid":4242,"status":"idle"}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	p := &Plugin{id: "claude", o: Options{RuntimeDir: rt, Executable: "claude"}}
+	sessions := []domain.Session{
+		{PluginID: "claude", AgentType: "claude", SessionID: "sid-old", LastKind: domain.EventTurnComplete},
+		{PluginID: "claude", AgentType: "claude", SessionID: "sid-new", LastKind: domain.EventTurnComplete},
+	}
+	ss, err := p.DetectActive(context.Background(), sessions, []domain.Process{{PID: 4242, Executable: "claude", Args: []string{"claude", "--resume", "sid-old"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ss[0].Status != "" {
+		t.Fatalf("the session the process was started with is no longer active: %#v", ss[0])
+	}
+	if ss[1].Status != domain.StatusReady {
+		t.Fatalf("the session the runtime json names should be ready: %#v", ss[1])
+	}
+
+	// A process the runtime json does not know yet (just started) is still matched by its arguments.
+	ss, err = p.DetectActive(context.Background(), []domain.Session{sessions[0]}, []domain.Process{{PID: 5555, Executable: "claude", Args: []string{"claude", "--resume", "sid-old"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ss[0].Status != domain.StatusReady {
+		t.Fatalf("an unmapped process should still match by its arguments: %#v", ss[0])
+	}
+}
+
 // A background shell (run_in_background) outlives the agent turn: older releases report the runtime
 // status idle while a shell child of the claude pid is still running. The session must be shown as
 // a finished turn with a shell still working, neither ready nor running.

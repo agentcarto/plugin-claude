@@ -851,6 +851,15 @@ func (p *Plugin) DetectActive(_ context.Context, ss []domain.Session, ps []domai
 			pidMatched[sid] = true
 		}
 	}
+	// A process the runtime json maps is on that session whatever its arguments say: after a /clear,
+	// `claude --resume <id>` still names the session it was started with. Only processes the runtime
+	// json does not know are matched by their arguments and open files.
+	unmapped := make([]domain.Process, 0, len(ps))
+	for _, pr := range ps {
+		if _, known := pidToSession[pr.PID]; !known {
+			unmapped = append(unmapped, pr)
+		}
+	}
 	// shell detection: Claude Code runs its Bash tool by spawning a shell as a direct child of the
 	// claude process. A background shell (run_in_background) outlives the turn. Newer releases
 	// report that state themselves as the runtime status "shell", but older ones flip to "idle"
@@ -888,7 +897,7 @@ func (p *Plugin) DetectActive(_ context.Context, ss []domain.Session, ps []domai
 	}
 	for i := range ss {
 		s := &ss[i]
-		matched := common.ProcessMatches(*s, ps) || pidMatched[s.SessionID] || cwdMatched[s.SessionID]
+		matched := common.ProcessMatches(*s, unmapped) || pidMatched[s.SessionID] || cwdMatched[s.SessionID]
 		if rt := runtimeBy[s.SessionID]; rt != nil && matched {
 			switch common.String(rt["status"]) {
 			case "busy", "waiting":
