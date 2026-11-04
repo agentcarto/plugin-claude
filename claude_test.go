@@ -863,6 +863,119 @@ func TestIsEmptyFork(t *testing.T) {
 	}
 }
 
+// Lines of a session made by Claude Code's /fork, cut down from a real one: the parent's history
+// copied with its uuids, then the <fork-source> notice under the last copied record (and the same
+// text enqueued).
+var slashForkChild = []string{
+	`{"type":"queue-operation","operation":"enqueue","timestamp":"2026-01-01T00:01:01Z","content":"<task-notification>\n<fork-source>\nThis session began as a fork (copy) of another session.\n</fork-source>\n</task-notification>"}`,
+	`{"uuid":"u1","parentUuid":null,"type":"user","cwd":"/work","timestamp":"2026-01-01T00:00:00Z","message":{"role":"user","content":"test"}}`,
+	`{"uuid":"a1","parentUuid":"u1","type":"assistant","timestamp":"2026-01-01T00:00:03Z","message":{"role":"assistant","stop_reason":"end_turn","content":[{"type":"text","text":"ok"}]}}`,
+	`{"uuid":"n1","parentUuid":"a1","type":"user","timestamp":"2026-01-01T00:01:01Z","origin":{"kind":"task-notification"},"message":{"role":"user","content":"<task-notification>\n<fork-source>\nThis session began as a fork (copy) of another session.\n</fork-source>\n</task-notification>"}}`,
+}
+
+// The first prompt sent to the fork, written under the notice.
+var slashForkContinuation = []string{
+	`{"uuid":"u2","parentUuid":"n1","type":"user","timestamp":"2026-01-01T00:05:00Z","message":{"role":"user","content":"carry on"}}`,
+	`{"uuid":"a2","parentUuid":"u2","type":"assistant","timestamp":"2026-01-01T00:05:03Z","message":{"role":"assistant","stop_reason":"end_turn","content":[{"type":"text","text":"done"}]}}`,
+}
+
+func writeSession(t *testing.T, path string, lines ...string) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte(strings.Join(lines, "\n")+"\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func scanOne(t *testing.T, root, path string) domain.Session {
+	t.Helper()
+	res, err := (&Plugin{id: "claude", o: Options{ProjectsDir: root}}).Scan(context.Background(), plugin.ScanInput{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, s := range res.Sessions {
+		if s.SourceRef.Source == path {
+			return s
+		}
+	}
+	t.Fatalf("%s not scanned: %#v", path, res.Sessions)
+	return domain.Session{}
+}
+
+// A /fork session nobody has prompted yet is the parent's history and nothing more: its fork
+// point is the last copied record, and like an unprompted PlanFork copy it is an empty fork.
+func TestScanSlashForkNotYetPromptedIsEmptyFork(t *testing.T) {
+	root := t.TempDir()
+	child := filepath.Join(root, "proj", "child.jsonl")
+	writeSession(t, child, slashForkChild...)
+	s := scanOne(t, root, child)
+	if s.ForkAt != "a1" || !s.EmptyFork {
+		t.Fatalf("ForkAt=%q EmptyFork=%v, want a1 and an empty fork", s.ForkAt, s.EmptyFork)
+	}
+	if s.Title != "test" {
+		t.Fatalf("title = %q, want the first copied prompt", s.Title)
+	}
+}
+
+func TestScanSlashForkPromptedIsNotEmptyFork(t *testing.T) {
+	root := t.TempDir()
+	child := filepath.Join(root, "proj", "child.jsonl")
+	writeSession(t, child, append(append([]string{}, slashForkChild...), slashForkContinuation...)...)
+	s := scanOne(t, root, child)
+	if s.ForkAt != "a1" || s.EmptyFork {
+		t.Fatalf("ForkAt=%q EmptyFork=%v, want a1 and a continued fork", s.ForkAt, s.EmptyFork)
+	}
+}
+
+// The fork-source notice is not part of any turn: the fork's first prompt continues right below
+// the fork point, and nothing of the notice (task block or queued copy) is shown.
+func TestLoadConversationSlashForkLeavesOutForkSourceNotice(t *testing.T) {
+	src := filepath.Join(t.TempDir(), "child.jsonl")
+	writeSession(t, src, append(append([]string{}, slashForkChild...), slashForkContinuation...)...)
+	c, err := (&Plugin{}).LoadConversation(context.Background(), domain.SessionRef{Source: src})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := c.Nodes["n1"]; ok {
+		t.Fatal("the fork-source notice should not be a node")
+	}
+	if got := c.Nodes["u2"].Parent; got != "a1" {
+		t.Fatalf("the fork's first prompt hangs under %q, want the fork point a1", got)
+	}
+	if path := c.ActivePath(); len(path) != 4 || path[len(path)-1] != "a2" {
+		t.Fatalf("active path = %v, want u1 a1 u2 a2", path)
+	}
+	for id, n := range c.Nodes {
+		for _, e := range n.Events {
+			if e.Kind == domain.EventTask || e.Kind == domain.EventQueued {
+				t.Fatalf("node %s shows %s %q from the notice", id, e.Kind, e.Text)
+			}
+		}
+	}
+}
+
+// Only a notice whose content is <fork-source> is left out; a task notification that merely
+// mentions the tag in its result still shows as a task.
+func TestParseKeepsTaskNotificationQuotingForkSource(t *testing.T) {
+	src := filepath.Join(t.TempDir(), "s.jsonl")
+	writeSession(t, src,
+		`{"uuid":"u1","parentUuid":null,"type":"user","timestamp":"2026-11-04T01:00:00Z","message":{"role":"user","content":"go"}}`,
+		`{"uuid":"t1","parentUuid":"u1","type":"user","timestamp":"2026-11-04T01:00:05Z","message":{"role":"user","content":"<task-notification>\n<task-id>b1</task-id>\n<status>completed</status>\n<result>saw <fork-source> in the log</result>\n</task-notification>"}}`,
+	)
+	_, nodes, _, _, _, _, _, forkAt := parse(context.Background(), src)
+	if forkAt != "" {
+		t.Fatalf("forkAt = %q, want none", forkAt)
+	}
+	for _, n := range nodes {
+		if n.ID == "t1" && len(n.Events) == 1 && n.Events[0].Kind == domain.EventTask {
+			return
+		}
+	}
+	t.Fatalf("the task notification should stay a task: %#v", nodes)
+}
+
 // Open a native fork on its own (the fallback path where the root ancestor isn't found). Since
 // the conversation display was canonicalized to start from the root ancestor, the old behavior of
 // classifying the parent's original continuation (directly under the fork point) as main(origin)

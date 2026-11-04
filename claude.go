@@ -68,7 +68,10 @@ func (Factory) Descriptor() plugin.Descriptor {
 	// carry Event.BetweenTurns, so the host leaves them out of the time of the turn they are filed
 	// under, and LastKind passes over them: one at the tail read as an answer being written, so a
 	// finished session without a runtime file stayed RUN.
-	return plugin.Descriptor{Type: "claude", DisplayName: "Claude", ParserVersion: "14", Capabilities: domain.Capabilities{Scan: true, Conversation: true, Active: true, Resume: true, Rewind: true, Relocate: true}}
+	// ParserVersion=15: a session made by Claude Code's /fork (a background session holding a copy
+	// of the parent's history) carries ForkAt, and its <fork-source> notice is left out instead of
+	// showing as an empty task in the parent's last turn.
+	return plugin.Descriptor{Type: "claude", DisplayName: "Claude", ParserVersion: "15", Capabilities: domain.Capabilities{Scan: true, Conversation: true, Active: true, Resume: true, Rewind: true, Relocate: true}}
 }
 
 func (Factory) New(id string, n *yaml.Node) (any, error) {
@@ -572,10 +575,15 @@ func isBareCompactOnlyNode(n domain.ConvNode) bool {
 	return e.Kind == domain.EventUser && strings.TrimSpace(e.Text) == "/compact" && e.Prompt == "" && e.Command == "" && e.RawType != domain.RawCompactSummary
 }
 
+// parse reads a session log into its flat events and conversation nodes. parentSID and parentLast
+// are the fork lineage: both come from a fork written by PlanFork, while a session made by Claude
+// Code's /fork yields only parentLast (its fork point), since its log never names the parent.
 func parse(ctx context.Context, path string) (ev []domain.Event, nodes []domain.ConvNode, queued []domain.Event, cwd string, start time.Time, model, parentSID, parentLast string) {
 	ordinals := map[string]int{}
 	var compactBoundaries []compactBoundary
 	idleCompact := false
+	forkNotices := map[string]string{} // fork-source notice uuid -> its parent
+	nativeForkAt := ""
 	_ = common.JSONLines(ctx, path, func(ordinal int, o map[string]any) error {
 		ts := common.Time(common.String(o["timestamp"]))
 		if start.IsZero() && !ts.IsZero() {
@@ -597,6 +605,20 @@ func parse(ctx context.Context, path string) (ev []domain.Event, nodes []domain.
 				if txt := common.String(o["content"]); strings.TrimSpace(txt) != "" {
 					queued = append(queued, domain.Event{Kind: domain.EventQueued, Text: txt, Timestamp: ts, RawType: "queued"})
 				}
+			}
+			return nil
+		}
+		// /fork copies the parent's history and writes this notice under the last copied record.
+		// Leaving it out of the tree gives the session the shape of a PlanFork copy (the copied
+		// history, then its own continuation right below the fork point), which isEmptyFork and
+		// the host's grafting rely on; kept, it would read as work of the parent's last turn.
+		if isForkSourceNotice(o, msg) {
+			parent := common.String(o["parentUuid"])
+			if id := common.String(o["uuid"]); id != "" {
+				forkNotices[id] = parent
+			}
+			if nativeForkAt == "" {
+				nativeForkAt = parent
 			}
 			return nil
 		}
@@ -671,6 +693,10 @@ func parse(ctx context.Context, path string) (ev []domain.Event, nodes []domain.
 		return nil
 	})
 	nodes = dropDuplicateManualCompactLeaves(nodes, ordinals, compactBoundaries)
+	reattachPastForkNotices(nodes, forkNotices)
+	if parentLast == "" {
+		parentLast = nativeForkAt
+	}
 	return ev, nodes, queued, cwd, start, model, parentSID, parentLast
 }
 
@@ -740,8 +766,9 @@ func isClaudeProcess(p domain.Process) bool {
 // isEmptyFork reports whether a full-copy fork has never been continued, i.e. its connection
 // point forkAt is a leaf with no children. agentcarto's PlanFork writes only root→target, so
 // before continuation target (=forkAt) is a leaf; continuing it adds a new node directly under
-// forkAt. A native fork (diff only, forkAt not in its own nodes) always has a child under forkAt,
-// so it returns false.
+// forkAt. A session made by Claude Code's /fork has the same shape once parse leaves out its
+// fork-source notice. A native fork (diff only, forkAt not in its own nodes) always has a child
+// under forkAt, so it returns false.
 func isEmptyFork(nodes []domain.ConvNode, forkAt string) bool {
 	if forkAt == "" {
 		return false
