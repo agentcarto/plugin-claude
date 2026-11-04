@@ -80,7 +80,9 @@ func (Factory) Descriptor() plugin.Descriptor {
 	// as an empty fork until a second prompt.
 	// ParserVersion=18: a later /fork of the parent still running its prompt's turn is no longer
 	// taken for the parent, though it holds a copy of the parent's /fork output.
-	return plugin.Descriptor{Type: "claude", DisplayName: "Claude", ParserVersion: "18", Capabilities: domain.Capabilities{Scan: true, Conversation: true, Active: true, Resume: true, Rewind: true, Relocate: true}}
+	// ParserVersion=19: a command Claude Code runs itself (/model, /fork, …) opens no turn and is
+	// marked as written between turns; it showed as a turn of its own with no reply.
+	return plugin.Descriptor{Type: "claude", DisplayName: "Claude", ParserVersion: "19", Capabilities: domain.Capabilities{Scan: true, Conversation: true, Active: true, Resume: true, Rewind: true, Relocate: true}}
 }
 
 func (Factory) New(id string, n *yaml.Node) (any, error) {
@@ -598,6 +600,10 @@ func parse(ctx context.Context, path string) (ev []domain.Event, nodes []domain.
 	// The session's own fork-source notice is the one queued for it; the copy of a session that
 	// was itself made by /fork also holds that session's notice, delivered.
 	queuedNotice, deliveredNotice := "", ""
+	// Where each record's node and events went, so that output found below a command can mark the
+	// command, which was read before it. The node's events and their copies in ev are separate.
+	type placement struct{ node, ev int }
+	placed := map[string]placement{}
 	_ = common.JSONLines(ctx, path, func(ordinal int, o map[string]any) error {
 		ts := common.Time(common.String(o["timestamp"]))
 		if start.IsZero() && !ts.IsZero() {
@@ -684,6 +690,16 @@ func parse(ctx context.Context, path string) (ev []domain.Event, nodes []domain.
 			}
 		}
 		annotate(es)
+		// Claude Code runs some commands itself (/model, /fork, …) and never sends them to the
+		// model. Nothing answers them, so like /clear they open no turn, and like a recap they take
+		// no part in the time of the turn they join. Newer versions log the command and its output
+		// as local_command records; older ones log the command as a user record, which only the
+		// output record below it tells apart from a command the model answers (a skill).
+		output := isLocalCommandOutput(o, msg)
+		if output || (common.String(o["type"]) == "system" && common.String(o["subtype"]) == "local_command") {
+			asLocalCommand(es)
+		}
+		evAt := len(ev)
 		ev = append(ev, es...)
 		if sr := common.String(msg["stop_reason"]); sr == "end_turn" {
 			ev = append(ev, domain.Event{Kind: domain.EventTurnComplete, Timestamp: ts, RawType: "end_turn"})
@@ -702,6 +718,11 @@ func parse(ctx context.Context, path string) (ev []domain.Event, nodes []domain.
 			if common.String(o["type"]) == "system" && common.String(o["subtype"]) == "compact_boundary" && common.String(metadata["trigger"]) == "manual" {
 				compactBoundaries = append(compactBoundaries, compactBoundary{parent: parent, ordinal: ordinal})
 			}
+			if at, ok := placed[parent]; ok && output {
+				asLocalCommand(nodes[at.node].Events)
+				asLocalCommand(ev[at.ev : at.ev+len(nodes[at.node].Events)])
+			}
+			placed[id] = placement{node: len(nodes), ev: evAt}
 			nodes = append(nodes, domain.ConvNode{ID: id, Parent: parent, Timestamp: ts, Events: es})
 		}
 		return nil

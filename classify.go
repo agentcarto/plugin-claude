@@ -75,6 +75,29 @@ func commandLabel(text string) string {
 	return ""
 }
 
+// isLocalCommandOutput reports whether the record holds the output of a command Claude Code ran
+// itself (/model, /fork, …) instead of sending it to the model.
+func isLocalCommandOutput(o, msg map[string]any) bool {
+	for _, text := range append(messageTexts(msg), common.String(o["content"])) {
+		text = strings.TrimSpace(text)
+		if strings.HasPrefix(text, "<local-command-stdout>") || strings.HasPrefix(text, "<local-command-stderr>") {
+			return true
+		}
+	}
+	return false
+}
+
+// asLocalCommand marks the user events of a command Claude Code ran itself, or of its output, as
+// opening no turn and written between turns. A prompt among them is left as it is.
+func asLocalCommand(es []domain.Event) {
+	for i := range es {
+		if es[i].Kind == domain.EventUser && es[i].Prompt == "" {
+			es[i].Command = ""
+			es[i].BetweenTurns = true
+		}
+	}
+}
+
 // messageTexts returns the text of a message's content: the content itself when it is a string,
 // and the text of each block when it is a list.
 func messageTexts(msg map[string]any) []string {

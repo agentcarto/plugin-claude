@@ -483,9 +483,8 @@ func TestParseMarksOnlyIdleCompactionAsBetweenTurns(t *testing.T) {
 }
 
 // Newer versions log slash commands only as system/local_command records; the
-// command invocation must surface as a user event (the core logic turns the
-// <command-name> wrapper into a turn boundary) while empty output wrappers stay
-// silent.
+// command invocation must surface as a user event while empty output wrappers
+// stay silent.
 func TestParseSystemLocalCommand(t *testing.T) {
 	d := t.TempDir()
 	src := filepath.Join(d, "s.jsonl")
@@ -807,6 +806,85 @@ func TestBashCommandOpensItsOwnTurn(t *testing.T) {
 	}
 	if hl := conversation.TurnHeadline(*c, turns[1]); hl != "! git status" {
 		t.Fatalf("second turn headline = %q, want the shell command", hl)
+	}
+}
+
+// A session with a /model run two hours after its first turn, written as newer versions log it
+// (system/local_command records) or as older ones did (a user record and its output).
+func localCommandSession(form string) []string {
+	command := map[string][]string{
+		"local_command records": {
+			`{"uuid":"c1","parentUuid":"a1","timestamp":"2026-01-01T02:00:00Z","type":"system","subtype":"local_command","content":"<command-name>/model</command-name>\n<command-message>model</command-message>\n<command-args></command-args>"}`,
+			`{"uuid":"c2","parentUuid":"c1","timestamp":"2026-01-01T02:00:00Z","type":"system","subtype":"local_command","content":"<local-command-stdout>Set model to Opus</local-command-stdout>","commandRun":{"command":"model","args":""}}`,
+		},
+		"user records": {
+			`{"uuid":"c1","parentUuid":"a1","timestamp":"2026-01-01T02:00:00Z","type":"user","message":{"role":"user","content":"<command-name>/model</command-name>\n<command-message>model</command-message>\n<command-args></command-args>"}}`,
+			`{"uuid":"c2","parentUuid":"c1","timestamp":"2026-01-01T02:00:00Z","type":"user","message":{"role":"user","content":"<local-command-stdout>Set model to Opus</local-command-stdout>"}}`,
+		},
+	}[form]
+	return append([]string{
+		`{"uuid":"u1","parentUuid":null,"timestamp":"2026-01-01T00:00:00Z","type":"user","message":{"role":"user","content":"first"}}`,
+		`{"uuid":"a1","parentUuid":"u1","timestamp":"2026-01-01T00:00:05Z","type":"assistant","message":{"role":"assistant","stop_reason":"end_turn","content":[{"type":"text","text":"ok"}]}}`,
+	}, command...)
+}
+
+// A command Claude Code runs itself (/model, /fork, …) is never answered by the model: it opens
+// no turn, and since it was run between turns it takes no part in the time of the turn it joins.
+func TestLocalCommandOpensNoTurn(t *testing.T) {
+	for _, form := range []string{"local_command records", "user records"} {
+		t.Run(form, func(t *testing.T) {
+			src := filepath.Join(t.TempDir(), "s.jsonl")
+			writeSession(t, src, append(localCommandSession(form),
+				`{"uuid":"u2","parentUuid":"c2","timestamp":"2026-01-01T02:00:10Z","type":"user","message":{"role":"user","content":"second"}}`)...)
+			c, err := (&Plugin{}).LoadConversation(context.Background(), domain.SessionRef{Source: src})
+			if err != nil {
+				t.Fatal(err)
+			}
+			turns := conversation.TurnsOfPath(*c, c.ActivePath())
+			if len(turns) != 2 || conversation.TurnHeadline(*c, turns[1]) != "second" {
+				t.Fatalf("turns = %v, want the two prompts' turns only", turns)
+			}
+			for _, id := range []string{"c1", "c2"} {
+				for _, e := range c.Nodes[id].Events {
+					if e.Command != "" || !e.BetweenTurns {
+						t.Fatalf("%s: %s %q Command=%q BetweenTurns=%v, want a command run between turns", id, e.Kind, e.Text, e.Command, e.BetweenTurns)
+					}
+				}
+			}
+		})
+	}
+}
+
+// Nor does a command run last make the session look as if a prompt had just been sent.
+func TestScanLocalCommandAtTheEndLeavesTheTurnFinished(t *testing.T) {
+	root := t.TempDir()
+	finished := filepath.Join(root, "proj", "finished.jsonl")
+	writeSession(t, finished, localCommandSession("user records")[:2]...)
+	for _, form := range []string{"local_command records", "user records"} {
+		src := filepath.Join(root, "proj", strings.ReplaceAll(form, " ", "-")+".jsonl")
+		writeSession(t, src, localCommandSession(form)...)
+		if got, want := scanOne(t, root, src).LastKind, scanOne(t, root, finished).LastKind; got != want {
+			t.Fatalf("%s: LastKind = %q, want %q as without the command", form, got, want)
+		}
+	}
+}
+
+// A command the model answers, such as a skill expanded into a prompt, still opens its own turn.
+func TestPromptCommandOpensItsTurn(t *testing.T) {
+	src := filepath.Join(t.TempDir(), "s.jsonl")
+	writeSession(t, src,
+		`{"uuid":"u1","parentUuid":null,"timestamp":"2026-01-01T00:00:00Z","type":"user","message":{"role":"user","content":"first"}}`,
+		`{"uuid":"a1","parentUuid":"u1","timestamp":"2026-01-01T00:00:05Z","type":"assistant","message":{"role":"assistant","stop_reason":"end_turn","content":[{"type":"text","text":"ok"}]}}`,
+		`{"uuid":"k1","parentUuid":"a1","timestamp":"2026-01-01T00:01:00Z","type":"user","message":{"role":"user","content":"<command-name>/verify</command-name>\n<command-message>verify</command-message>\n<command-args></command-args>"}}`,
+		`{"uuid":"k2","parentUuid":"k1","timestamp":"2026-01-01T00:01:00Z","type":"user","isMeta":true,"message":{"role":"user","content":[{"type":"text","text":"Verify the change."}]}}`,
+		`{"uuid":"k3","parentUuid":"k2","timestamp":"2026-01-01T00:01:05Z","type":"assistant","message":{"role":"assistant","stop_reason":"end_turn","content":[{"type":"text","text":"verified"}]}}`)
+	c, err := (&Plugin{}).LoadConversation(context.Background(), domain.SessionRef{Source: src})
+	if err != nil {
+		t.Fatal(err)
+	}
+	turns := conversation.TurnsOfPath(*c, c.ActivePath())
+	if len(turns) != 2 || conversation.TurnHeadline(*c, turns[1]) != "/verify" {
+		t.Fatalf("turns = %v, want the prompt's turn and the /verify turn", turns)
 	}
 }
 
