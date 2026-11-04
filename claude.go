@@ -71,7 +71,9 @@ func (Factory) Descriptor() plugin.Descriptor {
 	// ParserVersion=15: a session made by Claude Code's /fork (a background session holding a copy
 	// of the parent's history) carries ForkAt, and its <fork-source> notice is left out instead of
 	// showing as an empty task in the parent's last turn.
-	return plugin.Descriptor{Type: "claude", DisplayName: "Claude", ParserVersion: "15", Capabilities: domain.Capabilities{Scan: true, Conversation: true, Active: true, Resume: true, Rewind: true, Relocate: true}}
+	// ParserVersion=16: such a session also carries ParentSessionID, found through the output of
+	// the /fork in the parent's log.
+	return plugin.Descriptor{Type: "claude", DisplayName: "Claude", ParserVersion: "16", Capabilities: domain.Capabilities{Scan: true, Conversation: true, Active: true, Resume: true, Rewind: true, Relocate: true}}
 }
 
 func (Factory) New(id string, n *yaml.Node) (any, error) {
@@ -151,6 +153,9 @@ func (p *Plugin) scanSession(ctx context.Context, f string) (domain.Session, boo
 		return domain.Session{}, false
 	}
 	id := common.IDFromPath(f)
+	if psid == "" && plast != "" {
+		psid = slashForkParent(ctx, f, id, nodes, plast)
+	}
 	last := lastActivity(ev)
 	if cwd == "" {
 		cwd = "(unknown)"

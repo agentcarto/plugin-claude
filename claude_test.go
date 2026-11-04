@@ -956,6 +956,72 @@ func TestLoadConversationSlashForkLeavesOutForkSourceNotice(t *testing.T) {
 	}
 }
 
+const (
+	forkParentID = "defb4851-3c72-4d12-b74a-9dc1de2f7bc9"
+	forkChildID  = "e6684ea0-15ce-427b-85db-a924d4f68caf"
+)
+
+// The parent's side of a /fork, cut down from a real one: the copied history, then the command
+// and its output naming the new session by the first 8 characters of its id.
+var slashForkParentLines = []string{
+	`{"uuid":"u1","parentUuid":null,"type":"user","cwd":"/work","timestamp":"2026-01-01T00:00:00Z","message":{"role":"user","content":"test"}}`,
+	`{"uuid":"a1","parentUuid":"u1","type":"assistant","timestamp":"2026-01-01T00:00:03Z","message":{"role":"assistant","stop_reason":"end_turn","content":[{"type":"text","text":"ok"}]}}`,
+	`{"uuid":"c1","parentUuid":"a1","type":"system","subtype":"local_command","timestamp":"2026-01-01T00:01:00Z","content":"<command-name>/fork</command-name>\n<command-message>fork</command-message>\n<command-args></command-args>"}`,
+	`{"uuid":"c2","parentUuid":"c1","type":"system","subtype":"local_command","timestamp":"2026-01-01T00:01:00Z","content":"<local-command-stdout>session waiting for a prompt · e6684ea0</local-command-stdout>","commandRun":{"command":"fork","args":""}}`,
+}
+
+func TestScanSlashForkFindsParentByItsForkOutput(t *testing.T) {
+	root := t.TempDir()
+	proj := filepath.Join(root, "proj")
+	child := filepath.Join(proj, forkChildID+".jsonl")
+	writeSession(t, child, append(append([]string{}, slashForkChild...), slashForkContinuation...)...)
+	writeSession(t, filepath.Join(proj, forkParentID+".jsonl"), slashForkParentLines...)
+	// Sessions copied from the parent after its /fork hold the same output record. They sort
+	// before the parent so that only telling copies apart keeps them from being taken for it.
+	planForkCopy := make([]string, 0, len(slashForkParentLines))
+	for _, l := range slashForkParentLines {
+		planForkCopy = append(planForkCopy, strings.Replace(l, `{`, `{"parentSessionId":"`+forkParentID+`","parentLastUuid":"c2",`, 1))
+	}
+	writeSession(t, filepath.Join(proj, "11111111-0000-0000-0000-000000000000.jsonl"), planForkCopy...)
+	branchCopy := make([]string, 0, len(slashForkParentLines))
+	for _, l := range slashForkParentLines {
+		branchCopy = append(branchCopy, strings.Replace(l, `{`, `{"forkedFrom":{"sessionId":"`+forkParentID+`"},`, 1))
+	}
+	writeSession(t, filepath.Join(proj, "22222222-0000-0000-0000-000000000000.jsonl"), branchCopy...)
+	slashForkCopy := append(append([]string{}, slashForkParentLines...),
+		`{"uuid":"n2","parentUuid":"c2","type":"user","timestamp":"2026-01-01T00:02:00Z","message":{"role":"user","content":"<task-notification>\n<fork-source>\ncopy\n</fork-source>\n</task-notification>"}}`)
+	writeSession(t, filepath.Join(proj, "00000000-0000-0000-0000-000000000000.jsonl"), slashForkCopy...)
+
+	if s := scanOne(t, root, child); s.ParentSessionID != forkParentID || s.ForkAt != "a1" {
+		t.Fatalf("ParentSessionID=%q ForkAt=%q, want %s at a1", s.ParentSessionID, s.ForkAt, forkParentID)
+	}
+}
+
+// A parent that was itself made by /fork has its own notice first and the /fork that made the
+// child after it; only output before a notice is a copy.
+func TestScanSlashForkFindsParentThatIsItselfASlashFork(t *testing.T) {
+	root := t.TempDir()
+	proj := filepath.Join(root, "proj")
+	child := filepath.Join(proj, forkChildID+".jsonl")
+	writeSession(t, child, append(append([]string{}, slashForkChild...), slashForkContinuation...)...)
+	grandparentHistory := `{"uuid":"g1","parentUuid":null,"type":"user","timestamp":"2025-12-31T00:00:00Z","message":{"role":"user","content":"older"}}`
+	ownNotice := `{"uuid":"gn","parentUuid":"g1","type":"user","timestamp":"2025-12-31T00:01:00Z","message":{"role":"user","content":"<task-notification>\n<fork-source>\nx\n</fork-source>\n</task-notification>"}}`
+	writeSession(t, filepath.Join(proj, forkParentID+".jsonl"), append([]string{grandparentHistory, ownNotice}, slashForkParentLines...)...)
+	if s := scanOne(t, root, child); s.ParentSessionID != forkParentID {
+		t.Fatalf("ParentSessionID=%q, want %s", s.ParentSessionID, forkParentID)
+	}
+}
+
+// With the parent's log gone the fork still knows where it forked, just not from which session.
+func TestScanSlashForkWithoutParentLogKeepsForkPoint(t *testing.T) {
+	root := t.TempDir()
+	child := filepath.Join(root, "proj", forkChildID+".jsonl")
+	writeSession(t, child, append(append([]string{}, slashForkChild...), slashForkContinuation...)...)
+	if s := scanOne(t, root, child); s.ParentSessionID != "" || s.ForkAt != "a1" {
+		t.Fatalf("ParentSessionID=%q ForkAt=%q, want no parent and a1", s.ParentSessionID, s.ForkAt)
+	}
+}
+
 // Only a notice whose content is <fork-source> is left out; a task notification that merely
 // mentions the tag in its result still shows as a task.
 func TestParseKeepsTaskNotificationQuotingForkSource(t *testing.T) {
