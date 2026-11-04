@@ -78,7 +78,9 @@ func (Factory) Descriptor() plugin.Descriptor {
 	// its notice follows. They differ for a /fork given a prompt, whose notice comes after the
 	// prompt's turn: the session was shown with its parent's turns in place of its own, and hidden
 	// as an empty fork until a second prompt.
-	return plugin.Descriptor{Type: "claude", DisplayName: "Claude", ParserVersion: "17", Capabilities: domain.Capabilities{Scan: true, Conversation: true, Active: true, Resume: true, Rewind: true, Relocate: true}}
+	// ParserVersion=18: a later /fork of the parent still running its prompt's turn is no longer
+	// taken for the parent, though it holds a copy of the parent's /fork output.
+	return plugin.Descriptor{Type: "claude", DisplayName: "Claude", ParserVersion: "18", Capabilities: domain.Capabilities{Scan: true, Conversation: true, Active: true, Resume: true, Rewind: true, Relocate: true}}
 }
 
 func (Factory) New(id string, n *yaml.Node) (any, error) {

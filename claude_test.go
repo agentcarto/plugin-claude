@@ -1065,6 +1065,11 @@ func TestScanSlashForkFindsParentByItsForkOutput(t *testing.T) {
 	slashForkCopy := append(append([]string{}, slashForkParentLines...),
 		`{"uuid":"n2","parentUuid":"c2","type":"user","timestamp":"2026-01-01T00:02:00Z","message":{"role":"user","content":"<task-notification>\n<fork-source>\ncopy\n</fork-source>\n</task-notification>"}}`)
 	writeSession(t, filepath.Join(proj, "00000000-0000-0000-0000-000000000000.jsonl"), slashForkCopy...)
+	// A /fork given a prompt gets its notice only after that prompt's turn; until then the copy
+	// has nothing after it but the turn.
+	unnotifiedSlashForkCopy := append([]string{`{"type":"queue-operation","operation":"enqueue","timestamp":"2026-01-01T00:02:00Z","content":"` + noticeText("2026-01-01T00:01:00Z") + `"}`}, slashForkParentLines...)
+	unnotifiedSlashForkCopy = append(unnotifiedSlashForkCopy, `{"uuid":"f2","parentUuid":"c2","type":"user","timestamp":"2026-01-01T00:02:00Z","message":{"role":"user","content":"look into it"}}`)
+	writeSession(t, filepath.Join(proj, "33333333-0000-0000-0000-000000000000.jsonl"), unnotifiedSlashForkCopy...)
 
 	if s := scanOne(t, root, child); s.ParentSessionID != forkParentID || s.ForkAt != "a1" {
 		t.Fatalf("ParentSessionID=%q ForkAt=%q, want %s at a1", s.ParentSessionID, s.ForkAt, forkParentID)
@@ -1086,15 +1091,24 @@ func TestScanSlashForkGivenAPromptFindsParentAtTheForkPoint(t *testing.T) {
 }
 
 // A parent that was itself made by /fork has its own notice first and the /fork that made the
-// child after it; only output before a notice is a copy.
+// child after it; only output before its own notice is a copy. A later fork of that parent, still
+// in the turn of its prompt, holds a copy of the parent's notice but not yet one of its own.
 func TestScanSlashForkFindsParentThatIsItselfASlashFork(t *testing.T) {
 	root := t.TempDir()
 	proj := filepath.Join(root, "proj")
 	child := filepath.Join(proj, forkChildID+".jsonl")
 	writeSession(t, child, append(append([]string{}, slashForkChild...), slashForkContinuation...)...)
-	grandparentHistory := `{"uuid":"g1","parentUuid":null,"type":"user","timestamp":"2025-12-31T00:00:00Z","message":{"role":"user","content":"older"}}`
-	ownNotice := `{"uuid":"gn","parentUuid":"g1","type":"user","timestamp":"2025-12-31T00:01:00Z","message":{"role":"user","content":"<task-notification>\n<fork-source>\nx\n</fork-source>\n</task-notification>"}}`
-	writeSession(t, filepath.Join(proj, forkParentID+".jsonl"), append([]string{grandparentHistory, ownNotice}, slashForkParentLines...)...)
+	parentNotice := noticeText("2025-12-31T00:00:00Z")
+	parentHistory := []string{
+		`{"type":"queue-operation","operation":"enqueue","timestamp":"2025-12-31T00:01:00Z","content":"` + parentNotice + `"}`,
+		`{"uuid":"g1","parentUuid":null,"type":"user","timestamp":"2025-12-31T00:00:00Z","message":{"role":"user","content":"older"}}`,
+		`{"uuid":"gn","parentUuid":"g1","type":"user","timestamp":"2025-12-31T00:01:00Z","message":{"role":"user","content":"` + parentNotice + `"}}`,
+	}
+	writeSession(t, filepath.Join(proj, forkParentID+".jsonl"), append(append([]string{}, parentHistory...), slashForkParentLines...)...)
+	sibling := []string{`{"type":"queue-operation","operation":"enqueue","timestamp":"2026-01-01T00:02:00Z","content":"` + noticeText("2026-01-01T00:01:00Z") + `"}`}
+	sibling = append(append(sibling, parentHistory[1:]...), slashForkParentLines...)
+	sibling = append(sibling, `{"uuid":"f2","parentUuid":"c2","type":"user","timestamp":"2026-01-01T00:02:00Z","message":{"role":"user","content":"look into it"}}`)
+	writeSession(t, filepath.Join(proj, "33333333-0000-0000-0000-000000000000.jsonl"), sibling...)
 	if s := scanOne(t, root, child); s.ParentSessionID != forkParentID {
 		t.Fatalf("ParentSessionID=%q, want %s", s.ParentSessionID, forkParentID)
 	}

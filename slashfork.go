@@ -135,8 +135,11 @@ func slashForkParent(ctx context.Context, path, childID string, nodes []domain.C
 
 // ranSlashForkOf reports whether the log at path ran the /fork whose output names short. A session
 // copied from that log carries the same record, so copies are passed over: a PlanFork copy marks
-// every record with parentSessionId, a /branch copy with forkedFrom, and a /fork copy puts its
-// fork-source notice after everything it copied.
+// every record with parentSessionId, a /branch copy with forkedFrom, and a /fork copy has nothing
+// of its own before its fork-source notice is delivered. That notice is queued before the copy is
+// written and delivered after it, once the session is idle, which for a /fork given a prompt is
+// after the prompt's turn. A notice delivered before then is one the copy took from a parent that
+// was itself made by /fork, and is told apart from the session's own by its text.
 func ranSlashForkOf(ctx context.Context, path, short string) bool {
 	f, err := os.Open(path)
 	if err != nil {
@@ -147,15 +150,23 @@ func ranSlashForkOf(ctx context.Context, path, short string) bool {
 	// only the few lines that mention short or the notice tag are decoded.
 	r := bufio.NewReaderSize(f, 64<<10)
 	found := false
+	awaited := "" // the session's own notice, queued and not yet delivered
 	for ctx.Err() == nil {
 		line, err := r.ReadBytes('\n')
 		switch {
-		case bytes.Contains(line, []byte(short)) && isOriginalSlashForkOutput(line, short):
+		case bytes.Contains(line, []byte(short)) && isOriginalSlashForkOutput(line, short) && awaited == "":
 			found = true
 		case bytes.Contains(line, []byte("<fork-source>")):
-			if o, e := common.UnmarshalJSONMap(line); e == nil {
-				if _, ok := forkSourceNotice(o, common.Map(o["message"])); ok {
-					found = false
+			o, e := common.UnmarshalJSONMap(line)
+			if e != nil {
+				break
+			}
+			if text, ok := enqueuedForkSourceNotice(o); ok {
+				awaited, found = strings.TrimSpace(text), false
+			} else if text, ok := forkSourceNotice(o, common.Map(o["message"])); ok {
+				found = false
+				if strings.TrimSpace(text) == awaited {
+					awaited = ""
 				}
 			}
 		}
