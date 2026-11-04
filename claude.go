@@ -2,6 +2,7 @@ package claude
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -73,7 +74,11 @@ func (Factory) Descriptor() plugin.Descriptor {
 	// showing as an empty task in the parent's last turn.
 	// ParserVersion=16: such a session also carries ParentSessionID, found through the output of
 	// the /fork in the parent's log.
-	return plugin.Descriptor{Type: "claude", DisplayName: "Claude", ParserVersion: "16", Capabilities: domain.Capabilities{Scan: true, Conversation: true, Active: true, Resume: true, Rewind: true, Relocate: true}}
+	// ParserVersion=17: the ForkAt of such a session is the last record it copied, not the record
+	// its notice follows. They differ for a /fork given a prompt, whose notice comes after the
+	// prompt's turn: the session was shown with its parent's turns in place of its own, and hidden
+	// as an empty fork until a second prompt.
+	return plugin.Descriptor{Type: "claude", DisplayName: "Claude", ParserVersion: "17", Capabilities: domain.Capabilities{Scan: true, Conversation: true, Active: true, Resume: true, Rewind: true, Relocate: true}}
 }
 
 func (Factory) New(id string, n *yaml.Node) (any, error) {
@@ -588,7 +593,9 @@ func parse(ctx context.Context, path string) (ev []domain.Event, nodes []domain.
 	var compactBoundaries []compactBoundary
 	idleCompact := false
 	forkNotices := map[string]string{} // fork-source notice uuid -> its parent
-	nativeForkAt := ""
+	// The session's own fork-source notice is the one queued for it; the copy of a session that
+	// was itself made by /fork also holds that session's notice, delivered.
+	queuedNotice, deliveredNotice := "", ""
 	_ = common.JSONLines(ctx, path, func(ordinal int, o map[string]any) error {
 		ts := common.Time(common.String(o["timestamp"]))
 		if start.IsZero() && !ts.IsZero() {
@@ -606,6 +613,9 @@ func parse(ctx context.Context, path string) (ev []domain.Event, nodes []domain.
 		}
 		msg := common.Map(o["message"])
 		if common.String(o["type"]) == "queue-operation" {
+			if text, ok := enqueuedForkSourceNotice(o); ok && queuedNotice == "" {
+				queuedNotice = text
+			}
 			if common.String(o["operation"]) == "enqueue" {
 				if txt := common.String(o["content"]); strings.TrimSpace(txt) != "" {
 					queued = append(queued, domain.Event{Kind: domain.EventQueued, Text: txt, Timestamp: ts, RawType: "queued"})
@@ -613,18 +623,15 @@ func parse(ctx context.Context, path string) (ev []domain.Event, nodes []domain.
 			}
 			return nil
 		}
-		// /fork copies the parent's history and writes this notice under the last copied record.
-		// Leaving it out of the tree gives the session the shape of a PlanFork copy (the copied
-		// history, then its own continuation right below the fork point), which isEmptyFork and
-		// the host's grafting rely on; kept, it would read as work of the parent's last turn.
-		if isForkSourceNotice(o, msg) {
-			parent := common.String(o["parentUuid"])
+		// /fork copies the parent's history and writes this notice below it. Leaving it out of the
+		// tree gives the session the shape of a PlanFork copy (the copied history, then its own
+		// continuation right below the fork point), which isEmptyFork and the host's grafting rely
+		// on; kept, it would read as work of the turn it follows.
+		if text, ok := forkSourceNotice(o, msg); ok {
 			if id := common.String(o["uuid"]); id != "" {
-				forkNotices[id] = parent
+				forkNotices[id] = common.String(o["parentUuid"])
 			}
-			if nativeForkAt == "" {
-				nativeForkAt = parent
-			}
+			deliveredNotice = text
 			return nil
 		}
 		// Use the model from the first assistant message.
@@ -700,7 +707,10 @@ func parse(ctx context.Context, path string) (ev []domain.Event, nodes []domain.
 	nodes = dropDuplicateManualCompactLeaves(nodes, ordinals, compactBoundaries)
 	reattachPastForkNotices(nodes, forkNotices)
 	if parentLast == "" {
-		parentLast = nativeForkAt
+		// Without the queued notice, the last delivered one is the session's own: a /fork copy
+		// puts its own notice after everything it copied.
+		notice := cmp.Or(queuedNotice, deliveredNotice)
+		parentLast = copyEnd(nodes, sharedHistoryEnd(notice))
 	}
 	return ev, nodes, queued, cwd, start, model, parentSID, parentLast
 }

@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"regexp"
 	"slices"
 	"strings"
 	"time"
@@ -16,29 +17,66 @@ import (
 	"github.com/agentcarto/core/domain"
 )
 
-// isForkSourceNotice reports whether a record is the notice Claude Code's /fork writes into the
-// new session: a user message holding a <task-notification> whose content is <fork-source>.
-// Requiring <fork-source> right after the opening tag keeps an ordinary task notification that
-// merely quotes the tag in its result from matching.
-func isForkSourceNotice(o, msg map[string]any) bool {
+// forkSourceNotice returns the text of the notice Claude Code's /fork writes into the new session,
+// when the record is that notice delivered as a user message.
+func forkSourceNotice(o, msg map[string]any) (string, bool) {
 	if common.String(o["type"]) != "user" {
-		return false
+		return "", false
 	}
-	texts := []string{common.String(msg["content"])}
-	for _, b := range common.Slice(msg["content"]) {
-		text, ok := b.(string)
-		if !ok {
-			text = common.Text(common.Map(b)["text"])
-		}
-		texts = append(texts, text)
-	}
-	for _, text := range texts {
-		rest, ok := strings.CutPrefix(strings.TrimSpace(text), "<task-notification>")
-		if ok && strings.HasPrefix(strings.TrimSpace(rest), "<fork-source>") {
-			return true
+	for _, text := range messageTexts(msg) {
+		if isForkSourceText(text) {
+			return text, true
 		}
 	}
-	return false
+	return "", false
+}
+
+// enqueuedForkSourceNotice returns the text of the notice when the record queues a fork-source
+// notice for delivery.
+func enqueuedForkSourceNotice(o map[string]any) (string, bool) {
+	if common.String(o["type"]) != "queue-operation" || common.String(o["operation"]) != "enqueue" {
+		return "", false
+	}
+	text := common.String(o["content"])
+	return text, isForkSourceText(text)
+}
+
+// isForkSourceText reports whether text is a fork-source notice: a <task-notification> whose
+// content is <fork-source>. Requiring <fork-source> right after the opening tag keeps an ordinary
+// task notification that merely quotes the tag in its result from matching.
+func isForkSourceText(text string) bool {
+	rest, ok := strings.CutPrefix(strings.TrimSpace(text), "<task-notification>")
+	return ok && strings.HasPrefix(strings.TrimSpace(rest), "<fork-source>")
+}
+
+var timestampPattern = regexp.MustCompile(`\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})`)
+
+// sharedHistoryEnd returns the time a fork-source notice gives as the end of the history the
+// session shares with its parent, which is the time of the last record copied from it, or the
+// zero time when the notice gives none. The notice states it in prose ("The conversation up to
+// <time> is shared history"); only the timestamp is taken, so rewording around it does not matter.
+func sharedHistoryEnd(notice string) time.Time {
+	return common.Time(timestampPattern.FindString(notice))
+}
+
+// copyEnd returns the last record a /fork session copied from its parent, given end, the end of
+// the history the two share. The copy is the parent's active path, written in order with the
+// parent's times before anything else, and everything the session writes itself is later than
+// end; so the last record, in the order of nodes, written no later than end ends the copy. Where
+// the notice was delivered says nothing about it: Claude Code delivers the notice once the session
+// is idle, and a /fork given a prompt has run that prompt's turn below the copy by then. It
+// returns "" when end is the zero time or no record qualifies.
+func copyEnd(nodes []domain.ConvNode, end time.Time) string {
+	if end.IsZero() {
+		return ""
+	}
+	last := ""
+	for _, n := range nodes {
+		if !n.Timestamp.IsZero() && !n.Timestamp.After(end) {
+			last = n.ID
+		}
+	}
+	return last
 }
 
 // reattachPastForkNotices points every node whose parent is a dropped fork-source notice at the
@@ -115,8 +153,10 @@ func ranSlashForkOf(ctx context.Context, path, short string) bool {
 		case bytes.Contains(line, []byte(short)) && isOriginalSlashForkOutput(line, short):
 			found = true
 		case bytes.Contains(line, []byte("<fork-source>")):
-			if o, e := common.UnmarshalJSONMap(line); e == nil && isForkSourceNotice(o, common.Map(o["message"])) {
-				found = false
+			if o, e := common.UnmarshalJSONMap(line); e == nil {
+				if _, ok := forkSourceNotice(o, common.Map(o["message"])); ok {
+					found = false
+				}
 			}
 		}
 		if err != nil {

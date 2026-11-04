@@ -75,6 +75,20 @@ func commandLabel(text string) string {
 	return ""
 }
 
+// messageTexts returns the text of a message's content: the content itself when it is a string,
+// and the text of each block when it is a list.
+func messageTexts(msg map[string]any) []string {
+	texts := []string{common.String(msg["content"])}
+	for _, b := range common.Slice(msg["content"]) {
+		text, ok := b.(string)
+		if !ok {
+			text = common.Text(common.Map(b)["text"])
+		}
+		texts = append(texts, text)
+	}
+	return texts
+}
+
 // annotate fills the normalized display fields, in place: Prompt/Command on
 // user events (compact summaries are boundaries of their own kind and never
 // carry a prompt), EventTask conversion for task notifications, and

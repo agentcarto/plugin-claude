@@ -863,14 +863,31 @@ func TestIsEmptyFork(t *testing.T) {
 	}
 }
 
-// Lines of a session made by Claude Code's /fork, cut down from a real one: the parent's history
-// copied with its uuids, then the <fork-source> notice under the last copied record (and the same
-// text enqueued).
+// noticeText is the body of the notice /fork leaves in the new session, cut down from a real
+// one; up to is the time of the last record it copied from the parent.
+func noticeText(upTo string) string {
+	return `<task-notification>\n<fork-source>\nThis session began as a fork (copy) of another session that is still running: a session whose self-reported name is 'work'. The conversation up to ` + upTo + ` is shared history with it; the two sessions have since diverged.\n</fork-source>\n</task-notification>`
+}
+
+// Lines of a session made by Claude Code's /fork, cut down from a real one: the notice enqueued,
+// the parent's history copied with its uuids, then the notice delivered under the last copied
+// record.
 var slashForkChild = []string{
-	`{"type":"queue-operation","operation":"enqueue","timestamp":"2026-01-01T00:01:01Z","content":"<task-notification>\n<fork-source>\nThis session began as a fork (copy) of another session.\n</fork-source>\n</task-notification>"}`,
+	`{"type":"queue-operation","operation":"enqueue","timestamp":"2026-01-01T00:01:01Z","content":"` + noticeText("2026-01-01T00:00:03Z") + `"}`,
 	`{"uuid":"u1","parentUuid":null,"type":"user","cwd":"/work","timestamp":"2026-01-01T00:00:00Z","message":{"role":"user","content":"test"}}`,
 	`{"uuid":"a1","parentUuid":"u1","type":"assistant","timestamp":"2026-01-01T00:00:03Z","message":{"role":"assistant","stop_reason":"end_turn","content":[{"type":"text","text":"ok"}]}}`,
-	`{"uuid":"n1","parentUuid":"a1","type":"user","timestamp":"2026-01-01T00:01:01Z","origin":{"kind":"task-notification"},"message":{"role":"user","content":"<task-notification>\n<fork-source>\nThis session began as a fork (copy) of another session.\n</fork-source>\n</task-notification>"}}`,
+	`{"uuid":"n1","parentUuid":"a1","type":"user","timestamp":"2026-01-01T00:01:01Z","origin":{"kind":"task-notification"},"message":{"role":"user","content":"` + noticeText("2026-01-01T00:00:03Z") + `"}}`,
+}
+
+// A session made by /fork given a prompt: the prompt runs as the fork's first turn, and the notice,
+// queued meanwhile, is delivered only after that turn.
+var slashForkWithPrompt = []string{
+	`{"type":"queue-operation","operation":"enqueue","timestamp":"2026-01-01T00:01:02Z","content":"` + noticeText("2026-01-01T00:00:03Z") + `"}`,
+	`{"uuid":"u1","parentUuid":null,"type":"user","cwd":"/work","timestamp":"2026-01-01T00:00:00Z","message":{"role":"user","content":"test"}}`,
+	`{"uuid":"a1","parentUuid":"u1","type":"assistant","timestamp":"2026-01-01T00:00:03Z","message":{"role":"assistant","stop_reason":"end_turn","content":[{"type":"text","text":"ok"}]}}`,
+	`{"uuid":"f1","parentUuid":"a1","type":"user","timestamp":"2026-01-01T00:01:01Z","message":{"role":"user","content":"look into it"}}`,
+	`{"uuid":"g1","parentUuid":"f1","type":"assistant","timestamp":"2026-01-01T00:01:05Z","message":{"role":"assistant","stop_reason":"end_turn","content":[{"type":"text","text":"looked"}]}}`,
+	`{"uuid":"n1","parentUuid":"g1","type":"user","timestamp":"2026-01-01T00:01:06Z","origin":{"kind":"task-notification"},"message":{"role":"user","content":"` + noticeText("2026-01-01T00:00:03Z") + `"}}`,
 }
 
 // The first prompt sent to the fork, written under the notice.
@@ -926,6 +943,63 @@ func TestScanSlashForkPromptedIsNotEmptyFork(t *testing.T) {
 	s := scanOne(t, root, child)
 	if s.ForkAt != "a1" || s.EmptyFork {
 		t.Fatalf("ForkAt=%q EmptyFork=%v, want a1 and a continued fork", s.ForkAt, s.EmptyFork)
+	}
+}
+
+// A fork given a prompt forks where the copy ends, not where its notice arrives after its first
+// turn, and that turn alone makes it more than the parent's history.
+func TestScanSlashForkGivenAPromptForksWhereTheCopyEnds(t *testing.T) {
+	root := t.TempDir()
+	child := filepath.Join(root, "proj", "child.jsonl")
+	writeSession(t, child, slashForkWithPrompt...)
+	s := scanOne(t, root, child)
+	if s.ForkAt != "a1" || s.EmptyFork {
+		t.Fatalf("ForkAt=%q EmptyFork=%v, want a1 and a continued fork", s.ForkAt, s.EmptyFork)
+	}
+}
+
+// Until the prompt's turn is over the notice is only queued, and the fork point is already known.
+func TestScanSlashForkInItsFirstTurnForksWhereTheCopyEnds(t *testing.T) {
+	root := t.TempDir()
+	child := filepath.Join(root, "proj", "child.jsonl")
+	writeSession(t, child, slashForkWithPrompt[:len(slashForkWithPrompt)-1]...)
+	s := scanOne(t, root, child)
+	if s.ForkAt != "a1" || s.EmptyFork {
+		t.Fatalf("ForkAt=%q EmptyFork=%v, want a1 and a continued fork", s.ForkAt, s.EmptyFork)
+	}
+}
+
+// A fork of a session that was itself made by /fork copies that session's notice along with its
+// history; the fork point is where its own copy ends, given by its own notice.
+func TestScanSlashForkOfASlashForkForksWhereItsOwnCopyEnds(t *testing.T) {
+	root := t.TempDir()
+	child := filepath.Join(root, "proj", "child.jsonl")
+	writeSession(t, child,
+		`{"type":"queue-operation","operation":"enqueue","timestamp":"2026-01-01T00:03:00Z","content":"`+noticeText("2026-01-01T00:02:03Z")+`"}`,
+		slashForkChild[1], slashForkChild[2], slashForkChild[3],
+		`{"uuid":"u2","parentUuid":"n1","type":"user","timestamp":"2026-01-01T00:02:00Z","message":{"role":"user","content":"carry on"}}`,
+		`{"uuid":"a2","parentUuid":"u2","type":"assistant","timestamp":"2026-01-01T00:02:03Z","message":{"role":"assistant","stop_reason":"end_turn","content":[{"type":"text","text":"done"}]}}`,
+		`{"uuid":"n2","parentUuid":"a2","type":"user","timestamp":"2026-01-01T00:03:00Z","message":{"role":"user","content":"`+noticeText("2026-01-01T00:02:03Z")+`"}}`)
+	s := scanOne(t, root, child)
+	if s.ForkAt != "a2" || !s.EmptyFork {
+		t.Fatalf("ForkAt=%q EmptyFork=%v, want a2 and an empty fork", s.ForkAt, s.EmptyFork)
+	}
+}
+
+// Without the end of the shared history the fork point is unknown, and the session is shown as
+// one of its own rather than tied to its parent at a guessed point.
+func TestScanSlashForkNoticeWithoutSharedHistoryEndHasNoLineage(t *testing.T) {
+	root := t.TempDir()
+	proj := filepath.Join(root, "proj")
+	child := filepath.Join(proj, forkChildID+".jsonl")
+	notice := strings.Replace(noticeText(""), "up to  is", "up to now is", 1)
+	writeSession(t, child,
+		slashForkChild[1], slashForkChild[2],
+		`{"uuid":"n1","parentUuid":"a1","type":"user","timestamp":"2026-01-01T00:01:01Z","message":{"role":"user","content":"`+notice+`"}}`)
+	writeSession(t, filepath.Join(proj, forkParentID+".jsonl"), slashForkParentLines...)
+	s := scanOne(t, root, child)
+	if s.ForkAt != "" || s.ParentSessionID != "" || s.EmptyFork {
+		t.Fatalf("ForkAt=%q ParentSessionID=%q EmptyFork=%v, want no lineage", s.ForkAt, s.ParentSessionID, s.EmptyFork)
 	}
 }
 
@@ -992,6 +1066,20 @@ func TestScanSlashForkFindsParentByItsForkOutput(t *testing.T) {
 		`{"uuid":"n2","parentUuid":"c2","type":"user","timestamp":"2026-01-01T00:02:00Z","message":{"role":"user","content":"<task-notification>\n<fork-source>\ncopy\n</fork-source>\n</task-notification>"}}`)
 	writeSession(t, filepath.Join(proj, "00000000-0000-0000-0000-000000000000.jsonl"), slashForkCopy...)
 
+	if s := scanOne(t, root, child); s.ParentSessionID != forkParentID || s.ForkAt != "a1" {
+		t.Fatalf("ParentSessionID=%q ForkAt=%q, want %s at a1", s.ParentSessionID, s.ForkAt, forkParentID)
+	}
+}
+
+// The output of a /fork given a prompt carries the prompt too, and the fork point found for the child
+// is one the parent has, so the child can be shown as a branch of the parent.
+func TestScanSlashForkGivenAPromptFindsParentAtTheForkPoint(t *testing.T) {
+	root := t.TempDir()
+	proj := filepath.Join(root, "proj")
+	child := filepath.Join(proj, forkChildID+".jsonl")
+	writeSession(t, child, slashForkWithPrompt...)
+	writeSession(t, filepath.Join(proj, forkParentID+".jsonl"), append(append([]string{}, slashForkParentLines[:3]...),
+		`{"uuid":"c2","parentUuid":"c1","type":"system","subtype":"local_command","timestamp":"2026-01-01T00:01:00Z","content":"<local-command-stdout>session running · look into it · e6684ea0</local-command-stdout>","commandRun":{"command":"fork","args":"look into it"}}`)...)
 	if s := scanOne(t, root, child); s.ParentSessionID != forkParentID || s.ForkAt != "a1" {
 		t.Fatalf("ParentSessionID=%q ForkAt=%q, want %s at a1", s.ParentSessionID, s.ForkAt, forkParentID)
 	}
