@@ -84,7 +84,10 @@ func (Factory) Descriptor() plugin.Descriptor {
 	// marked as written between turns; it showed as a turn of its own with no reply.
 	// ParserVersion=20: an AskUserQuestion call becomes an EventQuestion carrying the readable
 	// question; it was an EventToolCall whose raw input the host never showed or indexed.
-	return plugin.Descriptor{Type: "claude", DisplayName: "Claude", ParserVersion: "20", Capabilities: domain.Capabilities{Scan: true, Conversation: true, Active: true, Resume: true, Rewind: true, Relocate: true}}
+	// ParserVersion=21: the result of such a call becomes an EventAnswer carrying what the user
+	// answered, or that they turned the questions down; it was an EventToolResult, which the host
+	// does not show or index.
+	return plugin.Descriptor{Type: "claude", DisplayName: "Claude", ParserVersion: "21", Capabilities: domain.Capabilities{Scan: true, Conversation: true, Active: true, Resume: true, Rewind: true, Relocate: true}}
 }
 
 func (Factory) New(id string, n *yaml.Node) (any, error) {
@@ -270,13 +273,16 @@ func userOrAssistant(role string) domain.EventKind {
 	return domain.EventAssistant
 }
 
-// messageEvents converts a single message's content blocks into display events. A content block
-// may be a bare string or a typed object (text/thinking/tool_use/tool_result, plus the server-side
-// server_tool_use/advisor_tool_result variants); blocks of an unknown type produce no event. A call
-// of the ask tool becomes the question it puts to the user (EventQuestion) instead of a tool call.
-// advisorModel is the record's top-level advisorModel field (empty when absent), used to label the
-// otherwise-redacted advisor result.
-func messageEvents(msg map[string]any, ts time.Time, advisorModel string) []domain.Event {
+// messageEvents converts the content blocks of a record's message into display events. A content
+// block may be a bare string or a typed object (text/thinking/tool_use/tool_result, plus the
+// server-side server_tool_use/advisor_tool_result variants); blocks of an unknown type produce no
+// event. A call of the ask tool becomes the question it puts to the user (EventQuestion) instead
+// of a tool call, and its result the user's answer (EventAnswer). asked holds the tool_use ids of
+// the calls read as questions so far in the log, and gains those of rec. Beside the message, rec
+// carries the advisorModel that labels the otherwise-redacted advisor result and the fields an
+// answer is read from.
+func messageEvents(rec map[string]any, ts time.Time, asked map[string]bool) []domain.Event {
+	msg := common.Map(rec["message"])
 	role := common.String(msg["role"])
 	var es []domain.Event
 	for _, b := range common.Slice(msg["content"]) {
@@ -316,6 +322,7 @@ func messageEvents(msg map[string]any, ts time.Time, advisorModel string) []doma
 				// A call that cannot be read stays a tool call, raw input and all.
 				if q := common.QuestionText(askQuestions(m["input"])); q != "" {
 					k, tool, text = domain.EventQuestion, "", q
+					asked[common.String(m["id"])] = true
 				}
 			}
 		case "server_tool_use":
@@ -337,12 +344,17 @@ func messageEvents(msg map[string]any, ts time.Time, advisorModel string) []doma
 			if strings.TrimSpace(text) == "" {
 				text = nonTextSummary(m["content"])
 			}
+			if asked[common.String(m["tool_use_id"])] {
+				if a := askResponse(rec, m, text); a != "" {
+					k, text = domain.EventAnswer, a
+				}
+			}
 		case "advisor_tool_result":
 			// Fold the advisor call and its result into one tool-call block: the
 			// call input is empty and the advice is encrypted, so a separate result
 			// block adds nothing. The detail carries the ciphertext size and the
 			// tokens generated, or the error code on a failed call.
-			es = append(es, advisorCallEvent(m["content"], advisorModel, advisorTokens(msg), ts))
+			es = append(es, advisorCallEvent(m["content"], common.String(rec["advisorModel"]), advisorTokens(msg), ts))
 			continue
 		}
 		if k != domain.EventMeta {
@@ -613,6 +625,7 @@ func parse(ctx context.Context, path string) (ev []domain.Event, nodes []domain.
 	// command, which was read before it. The node's events and their copies in ev are separate.
 	type placement struct{ node, ev int }
 	placed := map[string]placement{}
+	asked := map[string]bool{} // tool_use ids of the ask calls read as questions
 	_ = common.JSONLines(ctx, path, func(ordinal int, o map[string]any) error {
 		ts := common.Time(common.String(o["timestamp"]))
 		if start.IsZero() && !ts.IsZero() {
@@ -660,7 +673,7 @@ func parse(ctx context.Context, path string) (ev []domain.Event, nodes []domain.
 		meta, _ := o["isMeta"].(bool)
 		var es []domain.Event
 		if !meta {
-			es = messageEvents(msg, ts, common.String(o["advisorModel"]))
+			es = messageEvents(o, ts, asked)
 			switch common.String(o["type"]) {
 			case "system":
 				es = append(es, systemEvents(o, ts)...)
