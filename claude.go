@@ -82,7 +82,9 @@ func (Factory) Descriptor() plugin.Descriptor {
 	// taken for the parent, though it holds a copy of the parent's /fork output.
 	// ParserVersion=19: a command Claude Code runs itself (/model, /fork, …) opens no turn and is
 	// marked as written between turns; it showed as a turn of its own with no reply.
-	return plugin.Descriptor{Type: "claude", DisplayName: "Claude", ParserVersion: "19", Capabilities: domain.Capabilities{Scan: true, Conversation: true, Active: true, Resume: true, Rewind: true, Relocate: true}}
+	// ParserVersion=20: an AskUserQuestion call becomes an EventQuestion carrying the readable
+	// question; it was an EventToolCall whose raw input the host never showed or indexed.
+	return plugin.Descriptor{Type: "claude", DisplayName: "Claude", ParserVersion: "20", Capabilities: domain.Capabilities{Scan: true, Conversation: true, Active: true, Resume: true, Rewind: true, Relocate: true}}
 }
 
 func (Factory) New(id string, n *yaml.Node) (any, error) {
@@ -270,7 +272,8 @@ func userOrAssistant(role string) domain.EventKind {
 
 // messageEvents converts a single message's content blocks into display events. A content block
 // may be a bare string or a typed object (text/thinking/tool_use/tool_result, plus the server-side
-// server_tool_use/advisor_tool_result variants); blocks of an unknown type produce no event.
+// server_tool_use/advisor_tool_result variants); blocks of an unknown type produce no event. A call
+// of the ask tool becomes the question it puts to the user (EventQuestion) instead of a tool call.
 // advisorModel is the record's top-level advisorModel field (empty when absent), used to label the
 // otherwise-redacted advisor result.
 func messageEvents(msg map[string]any, ts time.Time, advisorModel string) []domain.Event {
@@ -309,6 +312,12 @@ func messageEvents(msg map[string]any, ts time.Time, advisorModel string) []doma
 			k = domain.EventToolCall
 			tool = common.String(m["name"])
 			text = common.Text(m["input"])
+			if tool == askTool {
+				// A call that cannot be read stays a tool call, raw input and all.
+				if q := common.QuestionText(askQuestions(m["input"])); q != "" {
+					k, tool, text = domain.EventQuestion, "", q
+				}
+			}
 		case "server_tool_use":
 			// Server-side tools (web_search, web_fetch) record their invocation
 			// under this type instead of "tool_use"; surface them as tool calls.
@@ -703,7 +712,7 @@ func parse(ctx context.Context, path string) (ev []domain.Event, nodes []domain.
 		ev = append(ev, es...)
 		if sr := common.String(msg["stop_reason"]); sr == "end_turn" {
 			ev = append(ev, domain.Event{Kind: domain.EventTurnComplete, Timestamp: ts, RawType: "end_turn"})
-		} else if sr == "tool_use" && !hasEventKind(es, domain.EventToolCall) {
+		} else if sr == "tool_use" && !hasEventKind(es, domain.EventToolCall) && !hasEventKind(es, domain.EventQuestion) {
 			ev = append(ev, domain.Event{Kind: domain.EventToolCall, Timestamp: ts, RawType: "tool_use"})
 		}
 		if id := common.String(o["uuid"]); id != "" {
